@@ -177,6 +177,32 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.logger.info(f"Retrieved {len(orders)} orders")
         return orders
 
+    def get_active_markets_by_series(self, series_ticker: str) -> List[Dict]:
+        """Fetch all active/open markets for a given series ticker."""
+        self.logger.info(f"Fetching active markets for series: {series_ticker}")
+        path = "/markets"
+        params = {
+            "series_ticker": series_ticker,
+            "status": "open",
+            "limit": 100
+        }
+        response = self.make_request("GET", path, params=params)
+        markets = response.get("markets", [])
+        self.logger.info(f"Found {len(markets)} active markets for series {series_ticker}")
+        return markets
+
+    def cancel_all_orders_for_market(self) -> int:
+        """Cancel all resting orders for the current market."""
+        orders = self.get_orders()
+        cancelled = 0
+        for order in orders:
+            try:
+                self.cancel_order(order['order_id'])
+                cancelled += 1
+            except Exception as e:
+                self.logger.error(f"Failed to cancel order {order['order_id']}: {e}")
+        return cancelled
+
 class AvellanedaMarketMaker:
     def __init__(
         self,

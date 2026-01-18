@@ -1,155 +1,60 @@
 # Kalshi Market Maker Configuration
 # Updated: January 2026
-# Runtime: 1 year (31536000 seconds)
-# Min spread: $0.04 to cover Kalshi fees
+# Mode: Dynamic - auto-fetches active games from configured series
 
 # =============================================================================
-# NFL (PRO FOOTBALL) MARKETS
+# SERIES TO TRADE
 # =============================================================================
+# The bot will automatically fetch all active/open markets from these series
+# and run market makers for each game
 
-# Strategy: Super Bowl Champion 2026
-# Who will win Super Bowl LX?
-KXSB-26:
-  api:
-    market_ticker: KXSB-26
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 31536000
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 31536000
-    min_spread: 0.04
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
+series:
+  # NFL Individual Games
+  - KXNFLGAME      # NFL Moneyline (who wins)
+  - KXNFLSPREAD    # NFL Point Spread
+  - KXNFLTOTAL     # NFL Total Points
 
-# Strategy: Teams in Super Bowl 2026
-# Which teams will play in Super Bowl LX?
-KXTEAMSINSB-26:
-  api:
-    market_ticker: KXTEAMSINSB-26
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 31536000
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 31536000
-    min_spread: 0.04
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
-
-# Strategy: NFL Draft #1 Pick 2026
-# Who will be the #1 overall pick?
-KXNFLDRAFT1-26:
-  api:
-    market_ticker: KXNFLDRAFT1-26
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 31536000
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 31536000
-    min_spread: 0.04
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
+  # NBA Individual Games
+  - KXNBAGAME      # NBA Moneyline (who wins)
+  - KXNBATOTAL     # NBA Total Points
 
 # =============================================================================
-# NBA (PRO BASKETBALL) MARKETS
+# TIMING SETTINGS
 # =============================================================================
 
-# Strategy: NBA Championship 2026
-# Who will win the NBA Championship?
-KXNBA-26:
-  api:
-    market_ticker: KXNBA-26
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 31536000
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 31536000
-    min_spread: 0.04
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
+# How often to check for new markets (in seconds)
+# New games appear throughout the day, so check every 5 minutes
+refresh_interval: 300
 
-# Strategy: NBA Eastern Conference Champion 2026
-KXNBAEAST-26:
-  api:
-    market_ticker: KXNBAEAST-26
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 31536000
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 31536000
-    min_spread: 0.04
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
+# How long each market maker runs before recycling (in seconds)
+# Set to 1 hour - markets will be re-evaluated and restarted if still active
+market_duration: 3600
 
-# Strategy: NBA Playoff Qualifiers 2026
-# Which teams will make the playoffs?
-KXNBAPLAYOFF-26:
-  api:
-    market_ticker: KXNBAPLAYOFF-26
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 31536000
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 31536000
-    min_spread: 0.04
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
+# Loop interval - how often to update quotes (in seconds)
+dt: 2.0
 
-# Strategy: NBA Draft #1 Pick 2026
-# Who will be the #1 overall pick?
-KXNBADRAFT1-26:
-  api:
-    market_ticker: KXNBADRAFT1-26
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 31536000
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 31536000
-    min_spread: 0.04
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
+# Maximum number of markets to trade simultaneously
+# With $250 capital, limit concurrent markets to avoid spreading too thin
+max_concurrent_markets: 10
 
-# Strategy: NBA All Stars 2026
-# Who will be selected as All Stars?
-KXNBAALLSTARS-26:
-  api:
-    market_ticker: KXNBAALLSTARS-26
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 31536000
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 31536000
-    min_spread: 0.04
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
+# =============================================================================
+# MARKET MAKER PARAMETERS
+# =============================================================================
+
+market_maker:
+  # Position limits
+  max_position: 5              # Max contracts per market
+  position_limit_buffer: 0.1   # 10% buffer near limits
+
+  # Spread settings
+  min_spread: 0.04             # $0.04 minimum spread (covers fees)
+
+  # Avellaneda-Stoikov parameters
+  gamma: 0.1                   # Risk aversion (higher = wider spreads)
+  k: 1.5                       # Liquidity parameter
+  sigma: 0.001                 # Volatility estimate
+  inventory_skew_factor: 0.001 # Inventory adjustment weight
+
+  # Order settings
+  order_expiration: 3600       # Orders expire after 1 hour
+  trade_side: "yes"            # Trade on "yes" side
