@@ -3,55 +3,283 @@
 # Runtime: 1 year (31536000 seconds)
 # Min spread: $0.04 to cover Kalshi fees
 
-# Strategy 1: Fed Funds Rate - January 2026 Meeting
-# Market for predicting Fed funds rate after January FOMC meeting
+# =============================================================================
+# FEDERAL RESERVE MARKETS
+# =============================================================================
+
+# Strategy: Fed Funds Rate - January 2026 Meeting
 KXFED-26JAN:
   api:
-    market_ticker: KXFED-26JAN-T425  # 4.25% rate target bracket
+    market_ticker: KXFED-26JAN-T425
     trade_side: "yes"
   market_maker:
     max_position: 5
-    order_expiration: 31536000  # 1 year
+    order_expiration: 31536000
     gamma: 0.1
     k: 1.5
     sigma: 0.001
-    T: 31536000  # 1 year
+    T: 31536000
     min_spread: 0.04
     position_limit_buffer: 0.1
     inventory_skew_factor: 0.001
   dt: 2.0
 
-# Strategy 2: Fed Decision - March 2026 Meeting
-# High volume market for March FOMC rate decision
+# Strategy: Fed Funds Rate - March 2026 Meeting
 KXFED-26MAR:
   api:
-    market_ticker: KXFED-26MAR-T400  # 4.00% rate target bracket
+    market_ticker: KXFED-26MAR-T400
     trade_side: "yes"
   market_maker:
     max_position: 5
-    order_expiration: 31536000  # 1 year
+    order_expiration: 31536000
     gamma: 0.1
     k: 1.5
     sigma: 0.001
-    T: 31536000  # 1 year
+    T: 31536000
     min_spread: 0.04
     position_limit_buffer: 0.1
     inventory_skew_factor: 0.001
   dt: 2.0
 
-# Strategy 3: Large Rate Cut 2026
-# Will the Fed do a rate cut greater than 25bps this year?
+# Strategy: Large Rate Cut 2026
 KXLARGECUT-26:
   api:
     market_ticker: KXLARGECUT-26
     trade_side: "yes"
   market_maker:
     max_position: 5
-    order_expiration: 31536000  # 1 year
+    order_expiration: 31536000
     gamma: 0.1
     k: 1.5
     sigma: 0.001
-    T: 31536000  # 1 year
+    T: 31536000
+    min_spread: 0.04
+    position_limit_buffer: 0.1
+    inventory_skew_factor: 0.001
+  dt: 2.0
+
+# =============================================================================
+# CRYPTOCURRENCY MARKETS
+# =============================================================================
+
+# Strategy: Bitcoin Yearly High 2026
+# How high will Bitcoin get this year?
+KXBTCMAXY-26:
+  api:
+    market_ticker: KXBTCMAXY-26DEC31
+    trade_side: "yes"
+  market_maker:
+    max_position: 5
+    order_expiration: 31536000
+    gamma: 0.1
+    k: 1.5
+    sigma: 0.001
+    T: 31536000
+    min_spread: 0.04
+    position_limit_buffer: 0.1
+    inventory_skew_factor: 0.001
+  dt: 2.0
+
+# Strategy: Ethereum Yearly High 2026
+# How high will Ethereum get this year?
+KXETHMAXY-26:
+  api:
+    market_ticker: KXETHMAXY-26DEC31
+    trade_side: "yes"
+  market_maker:
+    max_position: 5
+    order_expiration: 31536000
+    gamma: 0.1
+    k: 1.5
+    sigma: 0.001
+    T: 31536000
+    min_spread: 0.04
+    position_limit_buffer: 0.1
+    inventory_skew_factor: 0.001
+  dt: 2.0
+
+# Strategy: Crypto Performance 2026
+# Which cryptocurrency will perform best?
+KXCRYPTOPERFORMY-26:
+  api:
+    market_ticker: KXCRYPTOPERFORMY-26
+    trade_side: "yes"
+  market_maker:
+    max_position: 5
+    order_expiration: 31536000
+    gamma: 0.1
+    k: 1.5
+    sigma: 0.001
+    T: 31536000
+    min_spread: 0.04
+    position_limit_buffer: 0.1
+    inventory_skew_factor: 0.001
+  dt: 2.0
+
+# Strategy: Crypto Positive Returns 2026
+# Will crypto have positive returns?
+KXCRYPTORETURNY-26:
+  api:
+    market_ticker: KXCRYPTORETURNY-26
+    trade_side: "yes"
+  market_maker:
+    max_position: 5
+    order_expiration: 31536000
+    gamma: 0.1
+    k: 1.5
+    sigma: 0.001
+    T: 31536000
+    min_spread: 0.04
+    position_limit_buffer: 0.1
+    inventory_skew_factor: 0.001
+  dt: 2.0
+
+# =============================================================================
+# NFL (PRO FOOTBALL) MARKETS
+# =============================================================================
+
+# Strategy: Super Bowl Champion 2026
+# Who will win Super Bowl LX?
+KXSB-26:
+  api:
+    market_ticker: KXSB-26
+    trade_side: "yes"
+  market_maker:
+    max_position: 5
+    order_expiration: 31536000
+    gamma: 0.1
+    k: 1.5
+    sigma: 0.001
+    T: 31536000
+    min_spread: 0.04
+    position_limit_buffer: 0.1
+    inventory_skew_factor: 0.001
+  dt: 2.0
+
+# Strategy: Teams in Super Bowl 2026
+# Which teams will play in Super Bowl LX?
+KXTEAMSINSB-26:
+  api:
+    market_ticker: KXTEAMSINSB-26
+    trade_side: "yes"
+  market_maker:
+    max_position: 5
+    order_expiration: 31536000
+    gamma: 0.1
+    k: 1.5
+    sigma: 0.001
+    T: 31536000
+    min_spread: 0.04
+    position_limit_buffer: 0.1
+    inventory_skew_factor: 0.001
+  dt: 2.0
+
+# Strategy: NFL Draft #1 Pick 2026
+# Who will be the #1 overall pick?
+KXNFLDRAFT1-26:
+  api:
+    market_ticker: KXNFLDRAFT1-26
+    trade_side: "yes"
+  market_maker:
+    max_position: 5
+    order_expiration: 31536000
+    gamma: 0.1
+    k: 1.5
+    sigma: 0.001
+    T: 31536000
+    min_spread: 0.04
+    position_limit_buffer: 0.1
+    inventory_skew_factor: 0.001
+  dt: 2.0
+
+# =============================================================================
+# NBA (PRO BASKETBALL) MARKETS
+# =============================================================================
+
+# Strategy: NBA Championship 2026
+# Who will win the NBA Championship?
+KXNBA-26:
+  api:
+    market_ticker: KXNBA-26
+    trade_side: "yes"
+  market_maker:
+    max_position: 5
+    order_expiration: 31536000
+    gamma: 0.1
+    k: 1.5
+    sigma: 0.001
+    T: 31536000
+    min_spread: 0.04
+    position_limit_buffer: 0.1
+    inventory_skew_factor: 0.001
+  dt: 2.0
+
+# Strategy: NBA Eastern Conference Champion 2026
+KXNBAEAST-26:
+  api:
+    market_ticker: KXNBAEAST-26
+    trade_side: "yes"
+  market_maker:
+    max_position: 5
+    order_expiration: 31536000
+    gamma: 0.1
+    k: 1.5
+    sigma: 0.001
+    T: 31536000
+    min_spread: 0.04
+    position_limit_buffer: 0.1
+    inventory_skew_factor: 0.001
+  dt: 2.0
+
+# Strategy: NBA Playoff Qualifiers 2026
+# Which teams will make the playoffs?
+KXNBAPLAYOFF-26:
+  api:
+    market_ticker: KXNBAPLAYOFF-26
+    trade_side: "yes"
+  market_maker:
+    max_position: 5
+    order_expiration: 31536000
+    gamma: 0.1
+    k: 1.5
+    sigma: 0.001
+    T: 31536000
+    min_spread: 0.04
+    position_limit_buffer: 0.1
+    inventory_skew_factor: 0.001
+  dt: 2.0
+
+# Strategy: NBA Draft #1 Pick 2026
+# Who will be the #1 overall pick?
+KXNBADRAFT1-26:
+  api:
+    market_ticker: KXNBADRAFT1-26
+    trade_side: "yes"
+  market_maker:
+    max_position: 5
+    order_expiration: 31536000
+    gamma: 0.1
+    k: 1.5
+    sigma: 0.001
+    T: 31536000
+    min_spread: 0.04
+    position_limit_buffer: 0.1
+    inventory_skew_factor: 0.001
+  dt: 2.0
+
+# Strategy: NBA All Stars 2026
+# Who will be selected as All Stars?
+KXNBAALLSTARS-26:
+  api:
+    market_ticker: KXNBAALLSTARS-26
+    trade_side: "yes"
+  market_maker:
+    max_position: 5
+    order_expiration: 31536000
+    gamma: 0.1
+    k: 1.5
+    sigma: 0.001
+    T: 31536000
     min_spread: 0.04
     position_limit_buffer: 0.1
     inventory_skew_factor: 0.001
