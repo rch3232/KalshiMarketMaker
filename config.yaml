@@ -1,47 +1,58 @@
-RATECUTCOUNT-24DEC31-T4:
+# Kalshi Market Maker Configuration
+# Updated: January 2026
+# Runtime: 1 year (31536000 seconds)
+# Min spread: $0.04 to cover Kalshi fees
+
+# Strategy 1: Fed Funds Rate - January 2026 Meeting
+# Market for predicting Fed funds rate after January FOMC meeting
+KXFED-26JAN:
   api:
-    market_ticker: RATECUTCOUNT-24DEC31-T4
+    market_ticker: KXFED-26JAN-T425  # 4.25% rate target bracket
     trade_side: "yes"
   market_maker:
     max_position: 5
-    order_expiration: 28800 # 8 hours
+    order_expiration: 31536000  # 1 year
     gamma: 0.1
     k: 1.5
     sigma: 0.001
-    T: 28800 # 8 hours
-    min_spread: 0.0
+    T: 31536000  # 1 year
+    min_spread: 0.04
     position_limit_buffer: 0.1
     inventory_skew_factor: 0.001
   dt: 2.0
 
-FEDDECISION-24NOV-C25:
+# Strategy 2: Fed Decision - March 2026 Meeting
+# High volume market for March FOMC rate decision
+KXFED-26MAR:
   api:
-    market_ticker: FEDDECISION-24NOV-C25
+    market_ticker: KXFED-26MAR-T400  # 4.00% rate target bracket
     trade_side: "yes"
   market_maker:
     max_position: 5
-    order_expiration: 28800 # 8 hours
+    order_expiration: 31536000  # 1 year
     gamma: 0.1
     k: 1.5
     sigma: 0.001
-    T: 28800 # 8 hours
-    min_spread: 0.0
+    T: 31536000  # 1 year
+    min_spread: 0.04
     position_limit_buffer: 0.1
     inventory_skew_factor: 0.001
   dt: 2.0
 
-FEDDECISION-24NOV-H0:
+# Strategy 3: Large Rate Cut 2026
+# Will the Fed do a rate cut greater than 25bps this year?
+KXLARGECUT-26:
   api:
-    market_ticker: FEDDECISION-24NOV-H0
+    market_ticker: KXLARGECUT-26
     trade_side: "yes"
   market_maker:
     max_position: 5
-    order_expiration: 28800 # 8 hours
+    order_expiration: 31536000  # 1 year
     gamma: 0.1
     k: 1.5
     sigma: 0.001
-    T: 28800 # 8 hours
-    min_spread: 0.0
+    T: 31536000  # 1 year
+    min_spread: 0.04
     position_limit_buffer: 0.1
     inventory_skew_factor: 0.001
   dt: 2.0
