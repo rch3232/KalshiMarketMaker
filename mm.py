@@ -364,3 +364,10 @@ class AvellanedaMarketMaker:
         except Exception as e:
             self.logger.error(f"Error in market maker loop: {e}")
             raise
+
+    def run(self, dt: float):
+        """Run the market maker loop until T is reached."""
+        self.logger.info(f"Starting market maker loop (T={self.T}s, dt={dt}s)")
+        while self.t < self.T:
+            self.run_iteration(dt)
+            time.sleep(dt)
