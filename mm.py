@@ -715,8 +715,10 @@ class KalshiTradingAPI(AbstractTradingAPI):
                 "ticker": market.get("ticker", self.market_ticker),
                 "status": market.get("status", "unknown"),
                 "title": market.get("title", ""),
+                "close_time": market.get("close_time"),  # ISO timestamp when trading closes
+                "category": market.get("category", ""),  # e.g., "Sports", "Politics"
             }
-            self.logger.info(f"Market info: tick_size=${min_tick_size:.4f} ({tick_cents}¢)")
+            self.logger.info(f"Market info: tick_size=${min_tick_size:.4f} ({tick_cents}¢), close_time={result['close_time']}")
             return result
         except Exception as e:
             self.logger.error(f"Failed to get market info: {e}")
@@ -1020,6 +1022,9 @@ class AvellanedaMarketMaker:
         is_incentive: bool = False,    # Whether this is an incentive market
         heavy_position_threshold: float = 0.5,  # Fraction of max_position that triggers heavy mode
         heavy_position_max_bid: float = 0.02,   # Max bid price when in heavy position mode
+        # Profitability constraint settings
+        near_close_seconds: int = 300,  # Seconds before close to allow small losses (5 min default)
+        max_loss_near_close: float = 0.05,  # Max allowed loss near close ($0.05 = 5 cents)
     ):
         self.logger = logger
         self.api = api
@@ -1038,6 +1043,8 @@ class AvellanedaMarketMaker:
         self.is_incentive = is_incentive
         self.heavy_position_threshold = heavy_position_threshold
         self.heavy_position_max_bid = heavy_position_max_bid
+        self.near_close_seconds = near_close_seconds
+        self.max_loss_near_close = max_loss_near_close
 
         # Cross-market position tracking to prevent guaranteed losses
         self.position_tracker = position_tracker or get_shared_position_tracker()
@@ -1050,6 +1057,10 @@ class AvellanedaMarketMaker:
         # Market tick size tracking (fetched once at startup)
         self.min_tick_size = None  # Will be set on first iteration
         self.use_subpenny = False  # True if min_tick_size < 0.01
+
+        # Market close time and category (fetched once at startup)
+        self.close_time = None  # Unix timestamp when trading closes
+        self.category = None    # Market category (e.g., "Sports")
 
         # Order tracking for Desired State Engine
         # Format: {'order_id': str, 'price': float, 'side': str, 'created_at': float, 'count': int}
@@ -1067,6 +1078,13 @@ class AvellanedaMarketMaker:
         self.in_dual_exit_mode = False
         # Track if we've completed a pair trade (hold both YES and NO until expiry)
         self.holding_pair = False
+
+        # Cost basis tracking for profitability constraint
+        # Tracks average cost of YES and NO positions to ensure pair trades are profitable
+        self.yes_cost_basis = 0.0  # Average price paid for YES contracts
+        self.no_cost_basis = 0.0   # Average price paid for NO contracts
+        self.yes_quantity = 0      # Number of YES contracts held
+        self.no_quantity = 0       # Number of NO contracts held
 
     def compute_reservation_price(self, mid_price: float, q: int, t: float) -> float:
         """Compute reservation price with inventory adjustment.
@@ -1239,7 +1257,7 @@ class AvellanedaMarketMaker:
         return yes_bid, no_bid
 
     def _fetch_tick_size(self) -> None:
-        """Fetch and cache the market's min_tick_size on first iteration."""
+        """Fetch and cache the market's min_tick_size, close_time, and category on first iteration."""
         if self.min_tick_size is not None:
             return  # Already fetched
 
@@ -1247,6 +1265,21 @@ class AvellanedaMarketMaker:
             market_info = self.api.get_market_info()
             self.min_tick_size = market_info.get("min_tick_size", 0.01)
             self.use_subpenny = self.min_tick_size < 0.01
+
+            # Parse close_time from ISO format to Unix timestamp
+            close_time_str = market_info.get("close_time")
+            if close_time_str:
+                from datetime import datetime
+                try:
+                    # Parse ISO format: "2024-01-15T18:00:00Z"
+                    close_dt = datetime.fromisoformat(close_time_str.replace('Z', '+00:00'))
+                    self.close_time = close_dt.timestamp()
+                    self.logger.info(f"Market closes at: {close_time_str} (in {int(self.close_time - time.time())}s)")
+                except Exception as e:
+                    self.logger.warning(f"Failed to parse close_time '{close_time_str}': {e}")
+                    self.close_time = None
+
+            self.category = market_info.get("category", "")
 
             if self.use_subpenny:
                 self.logger.info(f"SUB-PENNY MARKET: tick_size=${self.min_tick_size:.4f}, "
@@ -1258,6 +1291,109 @@ class AvellanedaMarketMaker:
             self.logger.warning(f"Failed to fetch tick size, defaulting to 1¢: {e}")
             self.min_tick_size = 0.01
             self.use_subpenny = False
+
+    def is_near_close(self) -> bool:
+        """Check if we're within near_close_seconds of market close.
+
+        Returns True if we should allow small losses to exit positions.
+        """
+        if self.close_time is None:
+            return False
+
+        seconds_until_close = self.close_time - time.time()
+        return seconds_until_close <= self.near_close_seconds and seconds_until_close > 0
+
+    def apply_profitability_constraint(self, yes_bid: float, no_bid: float, position: int) -> Tuple[float, float]:
+        """Apply profitability constraint to prevent guaranteed-loss pair trades.
+
+        Normal mode (not near close):
+        - If holding YES: Cap NO bid so YES_cost + NO_bid <= $1.00 (break even or profit)
+        - If holding NO: Cap YES bid so NO_cost + YES_bid <= $1.00
+
+        Near close mode:
+        - Allow small losses up to max_loss_near_close to exit positions
+        - This prevents being stuck with an open position when market closes
+
+        Args:
+            yes_bid: Desired YES bid price
+            no_bid: Desired NO bid price
+            position: Current position (positive = long YES, negative = long NO)
+
+        Returns:
+            Tuple of (constrained_yes_bid, constrained_no_bid)
+        """
+        if position == 0:
+            # No position, no constraint needed
+            return yes_bid, no_bid
+
+        near_close = self.is_near_close()
+        allowed_loss = self.max_loss_near_close if near_close else 0.0
+
+        if position > 0:
+            # Long YES - constrain NO bid to ensure profitability
+            # Total cost = yes_cost_basis + no_bid
+            # For profit: yes_cost_basis + no_bid <= 1.00 + allowed_loss
+            if self.yes_cost_basis > 0:
+                max_no_bid = 1.00 - self.yes_cost_basis + allowed_loss
+                if no_bid > max_no_bid:
+                    if near_close:
+                        self.logger.info(f"NEAR CLOSE: Allowing NO bid ${no_bid:.2f} -> ${max_no_bid:.2f} "
+                                       f"(YES cost=${self.yes_cost_basis:.2f}, max loss=${allowed_loss:.2f})")
+                    else:
+                        self.logger.info(f"PROFIT CONSTRAINT: Capping NO bid ${no_bid:.2f} -> ${max_no_bid:.2f} "
+                                       f"(YES cost=${self.yes_cost_basis:.2f}, would lose ${no_bid + self.yes_cost_basis - 1.0:.2f})")
+                    no_bid = max(0.01, max_no_bid)  # Don't go below 1 cent
+        else:
+            # Long NO - constrain YES bid to ensure profitability
+            if self.no_cost_basis > 0:
+                max_yes_bid = 1.00 - self.no_cost_basis + allowed_loss
+                if yes_bid > max_yes_bid:
+                    if near_close:
+                        self.logger.info(f"NEAR CLOSE: Allowing YES bid ${yes_bid:.2f} -> ${max_yes_bid:.2f} "
+                                       f"(NO cost=${self.no_cost_basis:.2f}, max loss=${allowed_loss:.2f})")
+                    else:
+                        self.logger.info(f"PROFIT CONSTRAINT: Capping YES bid ${yes_bid:.2f} -> ${max_yes_bid:.2f} "
+                                       f"(NO cost=${self.no_cost_basis:.2f}, would lose ${yes_bid + self.no_cost_basis - 1.0:.2f})")
+                    yes_bid = max(0.01, max_yes_bid)  # Don't go below 1 cent
+
+        return yes_bid, no_bid
+
+    def update_cost_basis(self, side: str, fill_price: float, fill_quantity: int) -> None:
+        """Update cost basis when a fill occurs.
+
+        Uses weighted average to track cost basis for multiple fills.
+
+        Args:
+            side: 'yes' or 'no'
+            fill_price: Price of the fill
+            fill_quantity: Number of contracts filled
+        """
+        if side == 'yes':
+            total_cost = (self.yes_cost_basis * self.yes_quantity) + (fill_price * fill_quantity)
+            self.yes_quantity += fill_quantity
+            if self.yes_quantity > 0:
+                self.yes_cost_basis = total_cost / self.yes_quantity
+            self.logger.info(f"COST BASIS UPDATE: YES {self.yes_quantity} contracts @ ${self.yes_cost_basis:.3f} avg")
+        else:
+            total_cost = (self.no_cost_basis * self.no_quantity) + (fill_price * fill_quantity)
+            self.no_quantity += fill_quantity
+            if self.no_quantity > 0:
+                self.no_cost_basis = total_cost / self.no_quantity
+            self.logger.info(f"COST BASIS UPDATE: NO {self.no_quantity} contracts @ ${self.no_cost_basis:.3f} avg")
+
+    def reset_cost_basis(self, side: str = None) -> None:
+        """Reset cost basis when position is closed.
+
+        Args:
+            side: 'yes', 'no', or None for both
+        """
+        if side is None or side == 'yes':
+            self.yes_cost_basis = 0.0
+            self.yes_quantity = 0
+        if side is None or side == 'no':
+            self.no_cost_basis = 0.0
+            self.no_quantity = 0
+        self.logger.debug(f"Cost basis reset for {side or 'all'}")
 
     def compute_tick_aware_quotes(self, yes_mid: float, q: int, t: float,
                                    market_yes_bid: float = 0, market_no_bid: float = 0,
@@ -1665,6 +1801,8 @@ class AvellanedaMarketMaker:
             entry_price = yes_bid
             self.logger.info(f"FILL DETECTED: Bought {position_delta} YES @ ~${entry_price:.2f}, "
                            f"position: {self.last_position} -> {current_position}")
+            # Update cost basis for profitability tracking
+            self.update_cost_basis('yes', entry_price, abs(position_delta))
         else:
             # Position decreased: we bought NO (or YES side order expired/cancelled)
             # This means we're now long NO and need the YES side to fill to flatten
@@ -1673,6 +1811,8 @@ class AvellanedaMarketMaker:
             entry_price = no_bid
             self.logger.info(f"FILL DETECTED: Bought {abs(position_delta)} NO @ ~${entry_price:.2f}, "
                            f"position: {self.last_position} -> {current_position}")
+            # Update cost basis for profitability tracking
+            self.update_cost_basis('no', entry_price, abs(position_delta))
 
         # Check if this fill neutralized a pending exit (opposite side filled)
         if self.pending_exit is not None:
@@ -1712,6 +1852,8 @@ class AvellanedaMarketMaker:
             self.pending_exit = None
             self.active_exit_order_id = None
             self.in_dual_exit_mode = False
+            # Reset cost basis when position is closed
+            self.reset_cost_basis()
         elif self.pending_exit is None and not self.holding_pair:
             # New fill that creates a position - track for potential exit
             # (Skip if we're holding a pair - no exit needed)
@@ -1970,17 +2112,11 @@ class AvellanedaMarketMaker:
                 self.t += dt
                 return
 
-            # Cost basis constraint REMOVED - it was too restrictive and preventing orders
-            # The constraint would cap opposite-side bids to guarantee profit, but this meant:
-            # - If cost basis is 0.55, max NO bid would be 0.44 (1.00 - 0.55 - 0.01)
-            # - If NO market is at 0.48, our 0.44 bid would never fill
-            # - Result: no orders placed, no liquidity provided, no chance to exit
-            #
-            # Better approach: Let the market maker provide liquidity at market prices.
-            # If we complete a pair trade at a small loss, that's better than being stuck.
-            # The tick-aware pricing and flip_skew already handle inventory management.
-            if q != 0:
-                self.logger.debug(f"Position: {q}, continuing with market-based pricing (no cost constraint)")
+            # Apply profitability constraint to prevent guaranteed-loss pair trades
+            # Normal mode: Caps opposite-side bids so cost basis + bid <= $1.00 (break even)
+            # Near close mode: Allows small losses up to max_loss_near_close to exit positions
+            if q != 0 and (self.yes_cost_basis > 0 or self.no_cost_basis > 0):
+                yes_bid, no_bid = self.apply_profitability_constraint(yes_bid, no_bid, q)
 
             # Log market state (handle None prices from post-only protection)
             def fmt_price(p, decimals=2):

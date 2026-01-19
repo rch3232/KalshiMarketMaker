@@ -276,6 +276,8 @@ def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.
         is_incentive=is_incentive,
         heavy_position_threshold=heavy_position_threshold,
         heavy_position_max_bid=heavy_position_max_bid,
+        near_close_seconds=mm_config.get('near_close_seconds', 300),
+        max_loss_near_close=mm_config.get('max_loss_near_close', 0.05),
     )
 
 

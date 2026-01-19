@@ -165,5 +165,18 @@ market_maker:
   exit_timeout: 30             # Seconds to wait before auto-exit (default: 30)
   exit_profit_target: 0.02     # Exit price = entry + this amount ($0.02 = 2 cents)
 
+  # ==========================================================================
+  # PROFITABILITY CONSTRAINT
+  # ==========================================================================
+  # Prevents guaranteed losses from buying both YES and NO at combined > $1.00
+  #
+  # Normal mode: If you bought YES at 70¢, it caps NO bid at 30¢ (break even)
+  # Near close mode: Allows small losses to exit positions before market closes
+  #
+  # Example: YES cost=70¢, max_loss=5¢ -> near close NO bid capped at 35¢
+
+  near_close_seconds: 300      # Seconds before close to allow small losses (5 min)
+  max_loss_near_close: 0.05    # Max loss allowed near close ($0.05 = 5 cents)
+
   # Order settings
   order_expiration: 300        # Orders expire after 5 minutes (faster refresh)
