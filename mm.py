@@ -4,6 +4,7 @@ import re
 import base64
 import requests
 import json
+import threading
 from typing import Dict, List, Tuple
 import logging
 import uuid
@@ -11,6 +12,13 @@ import math
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
+
+
+# Global rate limiter shared across all API instances (per Kalshi SDK recommendation)
+# Kalshi requires minimum 100ms between API calls
+_rate_limit_lock = threading.Lock()
+_last_api_call_time = 0
+RATE_LIMIT_MS = 100  # milliseconds between calls
 
 
 class AbstractTradingAPI(abc.ABC):
@@ -120,8 +128,22 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
         return base64.b64encode(signature).decode('utf-8')
 
+    def _rate_limit(self):
+        """Enforce rate limiting across all API instances (100ms between calls)."""
+        global _last_api_call_time
+        with _rate_limit_lock:
+            current_time_ms = int(time.time() * 1000)
+            elapsed = current_time_ms - _last_api_call_time
+            if elapsed < RATE_LIMIT_MS:
+                sleep_time = (RATE_LIMIT_MS - elapsed) / 1000.0
+                time.sleep(sleep_time)
+            _last_api_call_time = int(time.time() * 1000)
+
     def _make_request(self, method: str, endpoint: str, data: dict = None) -> dict:
         """Make an authenticated request to the Kalshi API."""
+        # Rate limit to avoid exceeding Kalshi API limits
+        self._rate_limit()
+
         # Build full URL: host + /trade-api/v2 + endpoint
         url = f"{self.host}/trade-api/v2{endpoint}"
 
