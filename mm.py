@@ -47,6 +47,12 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.logger = logger
         self.base_url = base_url
 
+        # Extract the path prefix from base_url for signing
+        # e.g., "https://api.elections.kalshi.com/trade-api/v2" -> "/trade-api/v2"
+        from urllib.parse import urlparse
+        parsed = urlparse(base_url)
+        self.path_prefix = parsed.path.rstrip('/')  # e.g., "/trade-api/v2"
+
         # Load the private key
         self.private_key = self._load_private_key(private_key)
         self.logger.info("API key authentication initialized")
@@ -93,8 +99,11 @@ class KalshiTradingAPI(AbstractTradingAPI):
         # Strip query parameters from path for signing
         path_without_query = path.split('?')[0]
 
-        # Message to sign: timestamp + method + path (without query params)
-        message = f"{timestamp}{method}{path_without_query}"
+        # Full path includes the API prefix (e.g., /trade-api/v2/portfolio/positions)
+        full_path = self.path_prefix + path_without_query
+
+        # Message to sign: timestamp + method + full_path (without query params)
+        message = f"{timestamp}{method}{full_path}"
         message_bytes = message.encode('utf-8')
 
         signature = self.private_key.sign(
