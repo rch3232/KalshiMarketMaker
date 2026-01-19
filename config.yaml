@@ -84,5 +84,10 @@ market_maker:
   flip_skew_factor: 0.03       # Asymmetric urgency for inventory flipping
                                # When long YES, pushes NO bid closer to mid by q*0.03
 
+  # Auto-exit settings (for one-sided fills)
+  # If one side fills but the opposite doesn't within timeout, exit at small profit
+  exit_timeout: 30             # Seconds to wait before auto-exit (default: 30)
+  exit_profit_target: 0.02     # Exit price = entry + this amount ($0.02 = 2 cents)
+
   # Order settings
   order_expiration: 300        # Orders expire after 5 minutes (faster refresh)

@@ -115,6 +115,8 @@ def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.
     - sigma: Volatility estimate for binary outcomes
     - min/max_spread: Hard caps to prevent boundary-stuck quotes
     - flip_skew_factor: Asymmetric urgency for inventory flipping
+    - exit_timeout: Seconds before auto-exit triggers for one-sided fills
+    - exit_profit_target: Target profit when exiting ($0.02 default)
     """
     return AvellanedaMarketMaker(
         logger=logger,
@@ -129,6 +131,8 @@ def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.
         max_spread=mm_config.get('max_spread', 0.10),
         position_limit_buffer=mm_config.get('position_limit_buffer', 0.1),
         flip_skew_factor=mm_config.get('flip_skew_factor', 0.03),
+        exit_timeout=mm_config.get('exit_timeout', 30.0),
+        exit_profit_target=mm_config.get('exit_profit_target', 0.02),
     )
 
 

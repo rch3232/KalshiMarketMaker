@@ -519,6 +519,7 @@ class AvellanedaMarketMaker:
     - Simultaneous YES/NO bidding to capture spread from either direction
     - Asymmetric inventory urgency for aggressive position flipping
     - Hard adaptive caps to prevent quotes from getting stuck at boundaries
+    - Auto-exit: if one side fills but opposite doesn't within timeout, exits at small profit
     """
 
     def __init__(
@@ -535,6 +536,8 @@ class AvellanedaMarketMaker:
         max_spread: float = 0.10,      # Maximum spread ($0.10)
         position_limit_buffer: float = 0.1,
         flip_skew_factor: float = 0.03,  # Aggressive skew for inventory flipping
+        exit_timeout: float = 30.0,    # Seconds before auto-exit kicks in
+        exit_profit_target: float = 0.02,  # Target profit when exiting ($0.02)
     ):
         self.logger = logger
         self.api = api
@@ -548,10 +551,21 @@ class AvellanedaMarketMaker:
         self.max_spread = max_spread
         self.position_limit_buffer = position_limit_buffer
         self.flip_skew_factor = flip_skew_factor
+        self.exit_timeout = exit_timeout
+        self.exit_profit_target = exit_profit_target
 
         self.t = 0
         self.active_yes_order_id = None
         self.active_no_order_id = None
+
+        # Fill tracking for auto-exit feature
+        # Tracks the last known position to detect fills
+        self.last_position = None
+        # Tracks pending fills that need to be exited if opposite side doesn't fill
+        # Format: {'side': 'yes'|'no', 'entry_price': float, 'fill_time': float, 'quantity': int}
+        self.pending_exit = None
+        # Track if we have an active exit order
+        self.active_exit_order_id = None
 
     def compute_reservation_price(self, mid_price: float, q: int, t: float) -> float:
         """Compute reservation price with inventory adjustment.
@@ -723,6 +737,138 @@ class AvellanedaMarketMaker:
 
         return yes_bid, no_bid
 
+    def detect_fill_and_track(self, current_position: int, yes_bid: float, no_bid: float) -> bool:
+        """Detect if a fill occurred and track it for potential auto-exit.
+
+        Returns True if a new fill was detected that requires tracking.
+        """
+        if self.last_position is None:
+            # First iteration - just record position, no fill detection
+            self.last_position = current_position
+            return False
+
+        position_delta = current_position - self.last_position
+
+        if position_delta == 0:
+            # No fill occurred
+            return False
+
+        # A fill occurred - determine which side
+        if position_delta > 0:
+            # Position increased: we bought YES (or NO side order expired/cancelled)
+            # This means we're now long YES and need the NO side to fill to flatten
+            fill_side = 'yes'
+            # Entry price is our YES bid price
+            entry_price = yes_bid
+            self.logger.info(f"FILL DETECTED: Bought {position_delta} YES @ ~${entry_price:.2f}, "
+                           f"position: {self.last_position} -> {current_position}")
+        else:
+            # Position decreased: we bought NO (or YES side order expired/cancelled)
+            # This means we're now long NO and need the YES side to fill to flatten
+            fill_side = 'no'
+            # Entry price is our NO bid price
+            entry_price = no_bid
+            self.logger.info(f"FILL DETECTED: Bought {abs(position_delta)} NO @ ~${entry_price:.2f}, "
+                           f"position: {self.last_position} -> {current_position}")
+
+        # Check if this fill neutralized a pending exit (opposite side filled)
+        if self.pending_exit is not None:
+            pending_side = self.pending_exit['side']
+            if (pending_side == 'yes' and position_delta < 0) or \
+               (pending_side == 'no' and position_delta > 0):
+                # Opposite side filled - position is flattening
+                self.logger.info(f"POSITION FLATTENING: Opposite side filled, clearing pending exit")
+                self.pending_exit = None
+                self.active_exit_order_id = None
+
+        # If position is now 0, clear any pending exit
+        if current_position == 0:
+            if self.pending_exit is not None:
+                self.logger.info("Position is now flat, clearing pending exit")
+            self.pending_exit = None
+            self.active_exit_order_id = None
+        elif self.pending_exit is None:
+            # New fill that creates a position - track for potential exit
+            self.pending_exit = {
+                'side': fill_side,
+                'entry_price': entry_price,
+                'fill_time': time.time(),
+                'quantity': abs(position_delta),
+            }
+            self.logger.info(f"TRACKING FOR AUTO-EXIT: {fill_side} @ ${entry_price:.2f}, "
+                           f"will exit in {self.exit_timeout}s if opposite doesn't fill")
+
+        self.last_position = current_position
+        return True
+
+    def check_and_place_exit_order(self, current_position: int) -> bool:
+        """Check if we need to place an exit order and do so if timeout exceeded.
+
+        Returns True if an exit order was placed.
+        """
+        if self.pending_exit is None:
+            return False
+
+        if current_position == 0:
+            # Position already flat, no exit needed
+            self.pending_exit = None
+            self.active_exit_order_id = None
+            return False
+
+        elapsed = time.time() - self.pending_exit['fill_time']
+        if elapsed < self.exit_timeout:
+            # Not yet timed out, continue normal market making
+            remaining = self.exit_timeout - elapsed
+            self.logger.debug(f"Pending exit: {remaining:.1f}s remaining before auto-exit")
+            return False
+
+        # Timeout exceeded - place exit order
+        entry_price = self.pending_exit['entry_price']
+        exit_price = round(entry_price + self.exit_profit_target, 2)
+
+        # Clamp to valid range
+        exit_price = max(0.02, min(0.98, exit_price))
+
+        pending_side = self.pending_exit['side']
+        # Determine order parameters for exiting
+        # If we bought YES (pending_side='yes', position>0), we SELL YES
+        # If we bought NO (pending_side='no', position<0), we SELL NO
+        if pending_side == 'yes' and current_position > 0:
+            self.logger.info(f"AUTO-EXIT: Placing SELL YES @ ${exit_price:.2f} "
+                           f"(entry=${entry_price:.2f}, profit target=${self.exit_profit_target:.2f})")
+            try:
+                # Cancel existing orders first to avoid conflicts
+                self.cancel_existing_orders()
+                expiration_ts = int(time.time()) + self.order_expiration
+                self.active_exit_order_id = self.api.place_order(
+                    "sell", "yes", exit_price, abs(current_position), expiration_ts
+                )
+                return True
+            except Exception as e:
+                self.logger.error(f"Failed to place YES exit order: {e}")
+                return False
+        elif pending_side == 'no' and current_position < 0:
+            self.logger.info(f"AUTO-EXIT: Placing SELL NO @ ${exit_price:.2f} "
+                           f"(entry=${entry_price:.2f}, profit target=${self.exit_profit_target:.2f})")
+            try:
+                # Cancel existing orders first to avoid conflicts
+                self.cancel_existing_orders()
+                expiration_ts = int(time.time()) + self.order_expiration
+                self.active_exit_order_id = self.api.place_order(
+                    "sell", "no", exit_price, abs(current_position), expiration_ts
+                )
+                return True
+            except Exception as e:
+                self.logger.error(f"Failed to place NO exit order: {e}")
+                return False
+        else:
+            # Position flipped or something unexpected - clear pending
+            self.logger.warning(f"Position mismatch: pending_side={pending_side}, "
+                              f"current_position={current_position}, clearing pending exit")
+            self.pending_exit = None
+            self.active_exit_order_id = None
+            return False
+
     def cancel_existing_orders(self):
         """Cancel all existing orders to ensure fresh quotes at BBO."""
         try:
@@ -745,9 +891,9 @@ class AvellanedaMarketMaker:
         Each iteration:
         1. Fetches current market prices
         2. Gets current inventory position
-        3. Cancels ALL existing orders (ensures we're always at BBO)
-        4. Computes new dual quotes with inventory urgency
-        5. Places BUY orders on both YES and NO sides
+        3. Detects fills and tracks them for auto-exit
+        4. If in exit mode (timeout exceeded), places exit order and skips normal quoting
+        5. Otherwise, cancels all orders and places fresh dual quotes
         """
         try:
             # Get current market state
@@ -760,10 +906,7 @@ class AvellanedaMarketMaker:
             market_no_ask = price_data["no_ask"]
             q = self.api.get_position()
 
-            # Cancel all existing orders first (order management requirement)
-            self.cancel_existing_orders()
-
-            # Compute dual quotes with asymmetric inventory urgency
+            # Compute dual quotes (needed for fill detection even if not placing orders)
             yes_bid, no_bid = self.compute_dual_quotes(
                 yes_mid, q, self.t,
                 market_yes_bid=market_yes_bid,
@@ -771,6 +914,21 @@ class AvellanedaMarketMaker:
                 market_no_bid=market_no_bid,
                 market_no_ask=market_no_ask,
             )
+
+            # Detect fills and track for auto-exit
+            self.detect_fill_and_track(q, yes_bid, no_bid)
+
+            # Check if we need to exit (timeout exceeded)
+            if self.check_and_place_exit_order(q):
+                # Exit order placed - skip normal market making this iteration
+                # We'll continue normal operation once position is flat
+                self.logger.info("In exit mode - waiting for exit order to fill")
+                self.t += dt
+                return
+
+            # Normal market making mode
+            # Cancel all existing orders first (order management requirement)
+            self.cancel_existing_orders()
 
             self.logger.info(f"Market: YES mid=${yes_mid:.2f}, NO mid=${no_mid:.2f}")
             self.logger.info(f"Position: {q} | Quotes: BUY YES @${yes_bid:.2f}, BUY NO @${no_bid:.2f}")
@@ -811,6 +969,7 @@ class AvellanedaMarketMaker:
         self.logger.info(f"Parameters: gamma={self.gamma}, sigma={self.sigma}, "
                         f"spread=[{self.min_spread:.2f}, {self.max_spread:.2f}], "
                         f"flip_skew={self.flip_skew_factor}")
+        self.logger.info(f"Auto-exit: timeout={self.exit_timeout}s, profit_target=${self.exit_profit_target:.2f}")
         while self.t < self.T:
             self.run_iteration(dt)
             time.sleep(dt)
