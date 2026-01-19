@@ -755,6 +755,10 @@ class AvellanedaMarketMaker:
         self.pending_exit = None
         # Track if we have an active exit order
         self.active_exit_order_id = None
+        # Track if we're in dual exit mode (selling owned side + bidding on opposite)
+        self.in_dual_exit_mode = False
+        # Track if we've completed a pair trade (hold both YES and NO until expiry)
+        self.holding_pair = False
 
     def compute_reservation_price(self, mid_price: float, q: int, t: float) -> float:
         """Compute reservation price with inventory adjustment.
@@ -1217,6 +1221,26 @@ class AvellanedaMarketMaker:
             except Exception as e:
                 self.logger.warning(f"Failed to cancel {side} order: {e}")
 
+    def _is_exit_order_active(self) -> bool:
+        """Check if our exit sell order is still active (not filled).
+
+        Used in dual exit mode to determine if position went to 0 because:
+        - Exit order filled (we sold our position) -> return False
+        - Opposite side bid filled (pair trade completed) -> return True
+        """
+        if not self.active_exit_order_id:
+            return False
+
+        try:
+            orders = self.api.get_orders()
+            for order in orders:
+                if order.get('order_id') == self.active_exit_order_id:
+                    return True  # Exit order still resting, not filled
+            return False  # Exit order not in resting orders, must have filled
+        except Exception as e:
+            self.logger.warning(f"Could not check exit order status: {e}")
+            return False  # Assume filled on error
+
     def detect_fill_and_track(self, current_position: int, yes_bid: float, no_bid: float) -> bool:
         """Detect if a fill occurred and track it for potential auto-exit.
 
@@ -1271,19 +1295,50 @@ class AvellanedaMarketMaker:
             pending_side = self.pending_exit['side']
             if (pending_side == 'yes' and position_delta < 0) or \
                (pending_side == 'no' and position_delta > 0):
-                # Opposite side filled - position is flattening
-                self.logger.info(f"POSITION FLATTENING: Opposite side filled, clearing pending exit")
-                self.pending_exit = None
-                self.active_exit_order_id = None
+                # Position is flattening - but why?
+                # In dual exit mode, need to distinguish between:
+                # 1. Our sell order filled (exit complete)
+                # 2. Opposite side bid filled (pair trade complete)
+                if self.in_dual_exit_mode and current_position == 0:
+                    # Check if exit order is still active
+                    if self._is_exit_order_active():
+                        # Exit order NOT filled, so opposite side bid must have filled
+                        # This means we've completed a pair trade - hold both to expiry!
+                        self.logger.info(f"PAIR TRADE COMPLETED! Bought opposite side while holding {pending_side.upper()}")
+                        self.logger.info(f"Holding both YES and NO until expiry for guaranteed spread profit")
+                        self.holding_pair = True
+                        # Cancel the exit sell order since we're holding
+                        try:
+                            self.api.cancel_order(self.active_exit_order_id)
+                            self.logger.info(f"Canceled exit sell order - now holding pair to expiry")
+                        except Exception as e:
+                            self.logger.warning(f"Could not cancel exit order: {e}")
+                        self.pending_exit = None
+                        self.active_exit_order_id = None
+                        self.in_dual_exit_mode = False
+                    else:
+                        # Exit order filled - normal exit
+                        self.logger.info(f"EXIT COMPLETE: Sold {pending_side.upper()} position")
+                        self.pending_exit = None
+                        self.active_exit_order_id = None
+                        self.in_dual_exit_mode = False
+                else:
+                    # Not in dual exit mode or position not yet 0
+                    self.logger.info(f"POSITION FLATTENING: Opposite side filled, clearing pending exit")
+                    self.pending_exit = None
+                    self.active_exit_order_id = None
+                    self.in_dual_exit_mode = False
 
-        # If position is now 0, clear any pending exit
-        if current_position == 0:
+        # If position is now 0 and we're not holding a pair, clear any pending state
+        if current_position == 0 and not self.holding_pair:
             if self.pending_exit is not None:
                 self.logger.info("Position is now flat, clearing pending exit")
             self.pending_exit = None
             self.active_exit_order_id = None
-        elif self.pending_exit is None:
+            self.in_dual_exit_mode = False
+        elif self.pending_exit is None and not self.holding_pair:
             # New fill that creates a position - track for potential exit
+            # (Skip if we're holding a pair - no exit needed)
             self.pending_exit = {
                 'side': fill_side,
                 'entry_price': entry_price,
@@ -1296,35 +1351,53 @@ class AvellanedaMarketMaker:
         self.last_position = current_position
         return True
 
-    def check_and_place_exit_order(self, current_position: int, yes_mid: float = 0.50) -> bool:
+    def check_and_place_exit_order(self, current_position: int, yes_mid: float = 0.50) -> str:
         """Check if we need to place an exit order and do so if timeout exceeded.
+
+        DUAL EXIT MODE: After timeout, we run two strategies in parallel:
+        1. Try to SELL the owned side (exit at profit)
+        2. Continue bidding on opposite side to complete pair trade
+
+        If the opposite side fills while we have a sell order out, we've completed
+        a pair trade (hold both YES and NO). Cancel all orders and hold to expiry
+        for guaranteed spread profit.
 
         The exit price is calculated as max(cost_basis + 0.01, mid_price) to:
         1. Always ensure at least 1 cent profit above our actual cost
         2. Take advantage of favorable market conditions when mid > cost + 1 cent
 
-        Returns True if an exit order was placed.
+        Returns:
+            'none' - No exit needed or timeout not reached
+            'dual_exit' - Exit order placed, continue bidding on opposite side
+            'holding' - Pair trade completed, holding both sides
         """
+        # If already holding a pair, don't do anything
+        if self.holding_pair:
+            return 'holding'
+
         if self.pending_exit is None:
-            return False
+            self.in_dual_exit_mode = False
+            return 'none'
 
         if current_position == 0:
             # Position already flat, no exit needed
             self.pending_exit = None
             self.active_exit_order_id = None
-            return False
+            self.in_dual_exit_mode = False
+            return 'none'
 
         elapsed = time.time() - self.pending_exit['fill_time']
         if elapsed < self.exit_timeout:
             # Not yet timed out, continue normal market making
             remaining = self.exit_timeout - elapsed
             self.logger.debug(f"Pending exit: {remaining:.1f}s remaining before auto-exit")
-            return False
+            return 'none'
 
-        # Timeout exceeded - place exit order
-        # Get actual cost basis from the API instead of using tracked entry_price
+        # Timeout exceeded - enter DUAL EXIT MODE
+        # Place exit order but CONTINUE bidding on opposite side
         pending_side = self.pending_exit['side']
 
+        # Get actual cost basis from the API
         try:
             position_info = self.api.get_position_with_cost()
             if pending_side == 'yes':
@@ -1343,63 +1416,66 @@ class AvellanedaMarketMaker:
             self.logger.info(f"Got actual cost basis from API: ${cost_basis:.2f}")
 
         # Calculate exit price: max(cost + 1 cent, mid price)
-        # This ensures we always profit and take advantage of favorable mid
         min_exit_price = cost_basis + 0.01  # At least 1 cent above cost
 
         if pending_side == 'yes':
-            # Selling YES - use YES mid price
             mid_for_exit = yes_mid
         else:
-            # Selling NO - use NO mid price (1 - yes_mid)
             mid_for_exit = 1 - yes_mid
 
-        # Use the higher of minimum profitable price or current mid
         exit_price = round(max(min_exit_price, mid_for_exit), 2)
-
-        # Clamp to valid range
         exit_price = max(0.02, min(0.98, exit_price))
 
         self.logger.info(f"Exit price calculation: cost=${cost_basis:.2f}, min_exit=${min_exit_price:.2f}, "
                         f"mid=${mid_for_exit:.2f}, final=${exit_price:.2f}")
 
-        # Determine order parameters for exiting
-        # If we bought YES (pending_side='yes', position>0), we SELL YES
-        # If we bought NO (pending_side='no', position<0), we SELL NO
+        # Store cost basis for pair trade bid calculation
+        self.pending_exit['cost_basis'] = cost_basis
+
+        # If we already have an active exit order at the right price, don't replace it
+        if self.active_exit_order_id and self.in_dual_exit_mode:
+            self.logger.debug(f"DUAL EXIT: Already have exit order active, continuing to bid opposite side")
+            return 'dual_exit'
+
+        # Place exit order - cancel only the same-side BUY order (not the opposite side)
         if pending_side == 'yes' and current_position > 0:
-            self.logger.info(f"AUTO-EXIT: Placing SELL YES @ ${exit_price:.2f} "
-                           f"(cost=${cost_basis:.2f}, min profit=1¢)")
+            self.logger.info(f"DUAL EXIT: Placing SELL YES @ ${exit_price:.2f} "
+                           f"(cost=${cost_basis:.2f}), continuing NO bids")
             try:
-                # Cancel existing orders first to avoid conflicts
-                self.cancel_existing_orders()
+                # Cancel YES BUY order only (keep NO BUY order active)
+                self._cancel_side_if_exists('yes')
                 expiration_ts = int(time.time()) + self.order_expiration
                 self.active_exit_order_id = self.api.place_order(
                     "sell", "yes", exit_price, abs(current_position), expiration_ts
                 )
-                return True
+                self.in_dual_exit_mode = True
+                return 'dual_exit'
             except Exception as e:
                 self.logger.error(f"Failed to place YES exit order: {e}")
-                return False
+                return 'none'
         elif pending_side == 'no' and current_position < 0:
-            self.logger.info(f"AUTO-EXIT: Placing SELL NO @ ${exit_price:.2f} "
-                           f"(cost=${cost_basis:.2f}, min profit=1¢)")
+            self.logger.info(f"DUAL EXIT: Placing SELL NO @ ${exit_price:.2f} "
+                           f"(cost=${cost_basis:.2f}), continuing YES bids")
             try:
-                # Cancel existing orders first to avoid conflicts
-                self.cancel_existing_orders()
+                # Cancel NO BUY order only (keep YES BUY order active)
+                self._cancel_side_if_exists('no')
                 expiration_ts = int(time.time()) + self.order_expiration
                 self.active_exit_order_id = self.api.place_order(
                     "sell", "no", exit_price, abs(current_position), expiration_ts
                 )
-                return True
+                self.in_dual_exit_mode = True
+                return 'dual_exit'
             except Exception as e:
                 self.logger.error(f"Failed to place NO exit order: {e}")
-                return False
+                return 'none'
         else:
             # Position flipped or something unexpected - clear pending
             self.logger.warning(f"Position mismatch: pending_side={pending_side}, "
                               f"current_position={current_position}, clearing pending exit")
             self.pending_exit = None
             self.active_exit_order_id = None
-            return False
+            self.in_dual_exit_mode = False
+            return 'none'
 
     def cancel_existing_orders(self):
         """Cancel all existing orders to ensure fresh quotes at BBO."""
@@ -1455,57 +1531,88 @@ class AvellanedaMarketMaker:
             # Detect fills and track for auto-exit
             self.detect_fill_and_track(q, yes_bid, no_bid)
 
-            # Check if we need to exit (timeout exceeded)
-            if self.check_and_place_exit_order(q, yes_mid):
-                # Exit order placed - skip normal market making this iteration
-                self.logger.info("In exit mode - waiting for exit order to fill")
+            # Check if we need to exit (timeout exceeded) or handle dual exit mode
+            exit_status = self.check_and_place_exit_order(q, yes_mid)
+
+            if exit_status == 'holding':
+                # Pair trade completed - cancel all orders and hold to expiry
+                self.logger.info("HOLDING PAIR: Both YES and NO filled, holding to expiry for guaranteed spread")
+                self.cancel_existing_orders()
                 self.t += dt
                 return
 
             # Apply cost basis constraint when holding position
+            # In dual exit mode, use stored cost_basis; otherwise get from API
             min_profit_margin = 0.01 if not self.use_subpenny else 0.005
 
             if self.pending_exit is not None and q != 0:
-                try:
-                    position_info = self.api.get_position_with_cost()
+                # Get cost basis - prefer stored value in dual exit mode
+                cost_basis = self.pending_exit.get('cost_basis', 0)
+                if cost_basis <= 0:
+                    try:
+                        position_info = self.api.get_position_with_cost()
+                        if q > 0:
+                            cost_basis = position_info.get('yes_cost', 0)
+                        else:
+                            cost_basis = position_info.get('no_cost', 0)
+                    except Exception as e:
+                        self.logger.warning(f"Could not get cost basis for constraint check: {e}")
+                        cost_basis = self.pending_exit.get('entry_price', 0)
+
+                if cost_basis > 0:
                     if q > 0:  # Long YES, constraining NO bid
-                        yes_cost = position_info.get('yes_cost', 0)
-                        if yes_cost > 0:
-                            max_no_bid = 1.00 - yes_cost - min_profit_margin
-                            if self.use_subpenny:
-                                max_no_bid = round(max_no_bid * 200) / 200
-                            else:
-                                max_no_bid = round(max_no_bid, 2)
-                            if no_bid > max_no_bid:
-                                self.logger.info(f"COST BASIS CONSTRAINT: NO bid ${no_bid:.3f} exceeds "
-                                               f"max ${max_no_bid:.3f} (YES cost=${yes_cost:.3f}), capping")
-                                no_bid = max(0.02, max_no_bid)
+                        max_no_bid = 1.00 - cost_basis - min_profit_margin
+                        if self.use_subpenny:
+                            max_no_bid = round(max_no_bid * 200) / 200
+                        else:
+                            max_no_bid = round(max_no_bid, 2)
+                        if no_bid > max_no_bid:
+                            self.logger.info(f"COST BASIS CONSTRAINT: NO bid ${no_bid:.3f} exceeds "
+                                           f"max ${max_no_bid:.3f} (YES cost=${cost_basis:.3f}), capping")
+                            no_bid = max(0.02, max_no_bid)
                     elif q < 0:  # Long NO, constraining YES bid
-                        no_cost = position_info.get('no_cost', 0)
-                        if no_cost > 0:
-                            max_yes_bid = 1.00 - no_cost - min_profit_margin
-                            if self.use_subpenny:
-                                max_yes_bid = round(max_yes_bid * 200) / 200
-                            else:
-                                max_yes_bid = round(max_yes_bid, 2)
-                            if yes_bid > max_yes_bid:
-                                self.logger.info(f"COST BASIS CONSTRAINT: YES bid ${yes_bid:.3f} exceeds "
-                                               f"max ${max_yes_bid:.3f} (NO cost=${no_cost:.3f}), capping")
-                                yes_bid = max(0.02, max_yes_bid)
-                except Exception as e:
-                    self.logger.warning(f"Could not get cost basis for constraint check: {e}")
+                        max_yes_bid = 1.00 - cost_basis - min_profit_margin
+                        if self.use_subpenny:
+                            max_yes_bid = round(max_yes_bid * 200) / 200
+                        else:
+                            max_yes_bid = round(max_yes_bid, 2)
+                        if yes_bid > max_yes_bid:
+                            self.logger.info(f"COST BASIS CONSTRAINT: YES bid ${yes_bid:.3f} exceeds "
+                                           f"max ${max_yes_bid:.3f} (NO cost=${cost_basis:.3f}), capping")
+                            yes_bid = max(0.02, max_yes_bid)
 
             # Log market state
             if self.use_subpenny:
                 self.logger.info(f"Market: YES mid=${yes_mid:.3f}, NO mid=${no_mid:.3f} (sub-penny)")
-                self.logger.info(f"Position: {q} | Desired: BUY YES @${yes_bid:.3f}, BUY NO @${no_bid:.3f}")
+                if exit_status == 'dual_exit':
+                    # In dual exit, show which side we're bidding on
+                    opposite_side = 'NO' if self.pending_exit and self.pending_exit['side'] == 'yes' else 'YES'
+                    bid_price = no_bid if opposite_side == 'NO' else yes_bid
+                    self.logger.info(f"Position: {q} | DUAL EXIT: Selling owned + BUY {opposite_side} @${bid_price:.3f}")
+                else:
+                    self.logger.info(f"Position: {q} | Desired: BUY YES @${yes_bid:.3f}, BUY NO @${no_bid:.3f}")
             else:
                 self.logger.info(f"Market: YES mid=${yes_mid:.2f}, NO mid=${no_mid:.2f}")
-                self.logger.info(f"Position: {q} | Desired: BUY YES @${yes_bid:.2f}, BUY NO @${no_bid:.2f}")
+                if exit_status == 'dual_exit':
+                    opposite_side = 'NO' if self.pending_exit and self.pending_exit['side'] == 'yes' else 'YES'
+                    bid_price = no_bid if opposite_side == 'NO' else yes_bid
+                    self.logger.info(f"Position: {q} | DUAL EXIT: Selling owned + BUY {opposite_side} @${bid_price:.2f}")
+                else:
+                    self.logger.info(f"Position: {q} | Desired: BUY YES @${yes_bid:.2f}, BUY NO @${no_bid:.2f}")
 
             # DESIRED STATE ENGINE: Reconcile orders instead of cancel-and-replace
-            # This preserves queue priority and uses decrease endpoint when appropriate
-            self.reconcile_orders(yes_bid, no_bid, desired_count=1, position=q)
+            # In dual exit mode, only reconcile the opposite side (don't touch the sell order)
+            if exit_status == 'dual_exit' and self.pending_exit:
+                # Only reconcile opposite side - the owned side has a SELL order, not a BUY
+                if self.pending_exit['side'] == 'yes':
+                    # Long YES, selling YES, only bid on NO
+                    self._reconcile_side('no', no_bid, 1, int(time.time()) + self.order_expiration, time.time())
+                else:
+                    # Long NO, selling NO, only bid on YES
+                    self._reconcile_side('yes', yes_bid, 1, int(time.time()) + self.order_expiration, time.time())
+            else:
+                # Normal mode: reconcile both sides
+                self.reconcile_orders(yes_bid, no_bid, desired_count=1, position=q)
 
             self.t += dt
 
@@ -1521,6 +1628,7 @@ class AvellanedaMarketMaker:
         self.logger.info(f"Queue priority: MIN_ORDER_AGE={self.MIN_ORDER_AGE}s (won't reprice younger orders)")
         self.logger.info(f"Auto-exit: timeout={self.exit_timeout}s, profit_target=${self.exit_profit_target:.2f}")
         self.logger.info(f"Tick-aware pricing: 2¢ spread for 1¢ markets, 1¢ spread for 0.5¢ markets")
+        self.logger.info(f"DUAL EXIT MODE: After timeout, sells owned side + continues bidding opposite for pair trade")
         while self.t < self.T:
             self.run_iteration(dt)
             time.sleep(dt)
