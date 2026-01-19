@@ -151,8 +151,8 @@ def run_dynamic_strategies(config: Dict):
     # Check if private_key_env is a file path or the actual key
     if private_key_env.startswith('/') and os.path.isfile(private_key_env):
         runner_logger.info(f"Reading private key from file: {private_key_env}")
-        with open(private_key_env, 'r') as f:
-            private_key = f.read()
+        with open(private_key_env, 'rb') as f:
+            private_key = f.read()  # bytes, as per official Kalshi SDK
     else:
         private_key = private_key_env
         # Handle newlines in private key (environment variables often escape them)
@@ -241,8 +241,8 @@ def run_static_strategy(config_name: str, config: Dict):
     if private_key_env:
         if private_key_env.startswith('/') and os.path.isfile(private_key_env):
             logger.info(f"Reading private key from file: {private_key_env}")
-            with open(private_key_env, 'r') as f:
-                private_key = f.read()
+            with open(private_key_env, 'rb') as f:
+                private_key = f.read()  # bytes, as per official Kalshi SDK
         else:
             private_key = private_key_env.replace('\\n', '\n')
     else:

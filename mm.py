@@ -59,10 +59,17 @@ class KalshiTradingAPI(AbstractTradingAPI):
             self.host = "https://api.elections.kalshi.com"
         self.logger.info(f"Using API host: {self.host}")
 
-        # Normalize and load the private key
-        private_key_pem = self._normalize_pem_key(private_key, logger)
+        # Load the private key - handle both bytes (from file) and string (from env var)
+        if isinstance(private_key, bytes):
+            # Direct bytes from file (official Kalshi SDK approach)
+            key_data = private_key
+        else:
+            # String from environment variable - normalize and encode
+            key_str = self._normalize_pem_key(private_key, logger)
+            key_data = key_str.encode('utf-8')
+
         self.private_key = serialization.load_pem_private_key(
-            private_key_pem.encode(),
+            key_data,
             password=None,
             backend=default_backend()
         )
