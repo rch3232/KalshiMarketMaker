@@ -5,7 +5,7 @@ import base64
 import requests
 import json
 import threading
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 import logging
 import uuid
 import math
@@ -897,6 +897,62 @@ class KalshiTradingAPI(AbstractTradingAPI):
         except Exception as e:
             self.logger.error(f"Failed to fetch markets for category {category}: {e}")
             raise
+
+    def get_incentive_programs(self) -> List[Dict]:
+        """Get all active liquidity incentive programs.
+
+        Fetches from /v2/incentive_programs and filters for liquidity_incentive type.
+        These markets pay for having resting orders within 2 cents of strike.
+
+        Returns:
+            List of incentive program dictionaries containing:
+            - market_tickers: List of market tickers eligible for the incentive
+            - type: "liquidity_incentive" for liquidity rewards
+            - Other program metadata (rates, requirements, etc.)
+        """
+        self.logger.info("Fetching active liquidity incentive programs...")
+        try:
+            response = self._make_request("GET", "/incentive_programs")
+            programs = response.get("programs", []) or response.get("incentive_programs", [])
+
+            # Filter for liquidity incentive programs only
+            liquidity_programs = [
+                p for p in programs
+                if p.get('type') == 'liquidity_incentive' or p.get('program_type') == 'liquidity_incentive'
+            ]
+
+            self.logger.info(f"Found {len(liquidity_programs)} liquidity incentive programs "
+                           f"(out of {len(programs)} total programs)")
+            return liquidity_programs
+
+        except Exception as e:
+            self.logger.error(f"Failed to fetch incentive programs: {e}")
+            return []
+
+    def get_incentive_market_tickers(self) -> Set[str]:
+        """Get set of all market tickers that have active liquidity incentives.
+
+        Returns:
+            Set of market ticker strings that are eligible for liquidity incentives
+        """
+        programs = self.get_incentive_programs()
+        incentive_tickers = set()
+
+        for program in programs:
+            # Try different field names that might contain tickers
+            tickers = program.get('market_tickers', []) or program.get('tickers', [])
+            if isinstance(tickers, list):
+                incentive_tickers.update(tickers)
+            elif isinstance(tickers, str):
+                incentive_tickers.add(tickers)
+
+            # Also check for single ticker field
+            single_ticker = program.get('market_ticker') or program.get('ticker')
+            if single_ticker:
+                incentive_tickers.add(single_ticker)
+
+        self.logger.info(f"Found {len(incentive_tickers)} markets with liquidity incentives")
+        return incentive_tickers
 
 
 class AvellanedaMarketMaker:

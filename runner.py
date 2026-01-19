@@ -77,6 +77,129 @@ def check_market_liquidity(market: Dict, min_volume: int = 0, max_spread_cents: 
     return True, ""
 
 
+def check_longshot_bias(market: Dict, price_floor_cents: int = 20, price_ceiling_cents: int = 80) -> tuple[bool, str]:
+    """Check if a market price is within the safe zone to avoid long shot bias.
+
+    Long shot bias: Markets near extremes (e.g., 90/10 or 10/90) tend to be mispriced
+    and can result in losses. This filter skips markets outside the safe zone.
+
+    Args:
+        market: Market data from API
+        price_floor_cents: Minimum YES price in cents (default 20 = 20¢)
+        price_ceiling_cents: Maximum YES price in cents (default 80 = 80¢)
+
+    Returns:
+        tuple of (is_safe: bool, reason: str if not safe)
+    """
+    # Get bid/ask data to calculate mid-price
+    yes_bid = market.get('yes_bid', 0) or 0
+    yes_ask = market.get('yes_ask', 0) or 0
+
+    # If no bid/ask, try last_price
+    if yes_bid == 0 and yes_ask == 0:
+        last_price = market.get('last_price', 0) or 0
+        if last_price == 0:
+            return False, "no price data available"
+        yes_mid = last_price
+    elif yes_bid == 0:
+        yes_mid = yes_ask
+    elif yes_ask == 0:
+        yes_mid = yes_bid
+    else:
+        yes_mid = (yes_bid + yes_ask) / 2
+
+    # Check if price is within safe zone (in cents)
+    if yes_mid < price_floor_cents:
+        return False, f"long shot bias: YES price {yes_mid}¢ < {price_floor_cents}¢ floor"
+    if yes_mid > price_ceiling_cents:
+        return False, f"long shot bias: YES price {yes_mid}¢ > {price_ceiling_cents}¢ ceiling"
+
+    return True, ""
+
+
+# Global cache for incentive market tickers
+# Format: {'tickers': Set[str], 'last_refresh': float}
+_incentive_cache = {
+    'tickers': set(),
+    'last_refresh': 0,
+}
+_incentive_cache_lock = None  # Will be initialized on first use
+
+INCENTIVE_REFRESH_INTERVAL = 1800  # 30 minutes in seconds
+
+
+def get_incentive_tickers(api_key: str, private_key: str, base_url: str,
+                          force_refresh: bool = False) -> Set[str]:
+    """Get market tickers with active liquidity incentives.
+
+    Uses a 30-minute cache to avoid excessive API calls.
+    Incentive markets pay for resting orders within 2 cents of strike.
+
+    Args:
+        api_key: Kalshi API key
+        private_key: Kalshi private key
+        base_url: Kalshi API base URL
+        force_refresh: If True, bypass cache and fetch fresh data
+
+    Returns:
+        Set of market ticker strings with active liquidity incentives
+    """
+    global _incentive_cache, _incentive_cache_lock
+    import threading
+
+    # Initialize lock on first use
+    if _incentive_cache_lock is None:
+        _incentive_cache_lock = threading.Lock()
+
+    logger = logging.getLogger("IncentiveFetcher")
+    current_time = time.time()
+
+    with _incentive_cache_lock:
+        # Check if cache is still valid
+        cache_age = current_time - _incentive_cache['last_refresh']
+        if not force_refresh and cache_age < INCENTIVE_REFRESH_INTERVAL and _incentive_cache['tickers']:
+            logger.debug(f"Using cached incentive tickers ({len(_incentive_cache['tickers'])} tickers, "
+                        f"age: {cache_age:.0f}s)")
+            return _incentive_cache['tickers'].copy()
+
+        logger.info(f"Refreshing incentive market list (cache age: {cache_age:.0f}s)...")
+
+    # Fetch fresh data (outside lock to avoid blocking other threads)
+    try:
+        from mm import KalshiTradingAPI
+        temp_api = KalshiTradingAPI(
+            api_key=api_key,
+            private_key=private_key,
+            market_ticker="DUMMY",
+            base_url=base_url,
+            logger=logger
+        )
+
+        incentive_tickers = temp_api.get_incentive_market_tickers()
+        temp_api.logout()
+
+        # Update cache
+        with _incentive_cache_lock:
+            _incentive_cache['tickers'] = incentive_tickers
+            _incentive_cache['last_refresh'] = current_time
+
+        if incentive_tickers:
+            logger.info(f"Fetched {len(incentive_tickers)} markets with liquidity incentives")
+            # Log a sample of the tickers
+            sample = list(incentive_tickers)[:5]
+            logger.info(f"Sample incentive markets: {sample}")
+        else:
+            logger.info("No markets with liquidity incentives found")
+
+        return incentive_tickers.copy()
+
+    except Exception as e:
+        logger.error(f"Failed to fetch incentive tickers: {e}")
+        # Return cached data on error (may be stale but better than nothing)
+        with _incentive_cache_lock:
+            return _incentive_cache['tickers'].copy()
+
+
 def cleanup_logger(logger: logging.Logger):
     """Properly close and remove all handlers from a logger to prevent resource leaks."""
     handlers = logger.handlers[:]
@@ -344,8 +467,18 @@ def fetch_position_tickers(api_key: str, private_key: str, base_url: str) -> Set
     return position_tickers
 
 
-def fetch_active_markets_by_category(category: str, api_key: str, private_key: str, base_url: str,
-                                      min_volume: int = 0, max_spread_cents: int = 50) -> List[str]:
+def fetch_active_markets_by_category(
+    category: str,
+    api_key: str,
+    private_key: str,
+    base_url: str,
+    min_volume: int = 0,
+    max_spread_cents: int = 50,
+    incentive_tickers: Set[str] = None,
+    longshot_filter_enabled: bool = True,
+    longshot_price_floor: int = 20,
+    longshot_price_ceiling: int = 80,
+) -> tuple[List[str], List[str]]:
     """Fetch all active market tickers for a category (e.g., 'Sports').
 
     This function fetches ALL sports markets at once without needing to know
@@ -358,12 +491,22 @@ def fetch_active_markets_by_category(category: str, api_key: str, private_key: s
         base_url: Kalshi API base URL
         min_volume: Minimum volume required (0 = disabled)
         max_spread_cents: Maximum bid-ask spread in cents (default 50)
+        incentive_tickers: Set of tickers with active liquidity incentives (bypass longshot filter)
+        longshot_filter_enabled: Whether to apply long shot bias filter (default True)
+        longshot_price_floor: Minimum YES price in cents for longshot filter (default 20)
+        longshot_price_ceiling: Maximum YES price in cents for longshot filter (default 80)
 
     Returns:
-        List of active market ticker strings
+        Tuple of (incentive_market_tickers, regular_market_tickers)
+        - incentive_market_tickers: Markets with liquidity incentives (prioritized)
+        - regular_market_tickers: Other qualifying markets
     """
     logger = logging.getLogger("MarketFetcher")
-    active_tickers = []
+    incentive_market_list = []  # Markets with liquidity incentives (high priority)
+    regular_market_list = []    # Regular markets (normal priority)
+
+    if incentive_tickers is None:
+        incentive_tickers = set()
 
     try:
         temp_api = KalshiTradingAPI(
@@ -377,11 +520,16 @@ def fetch_active_markets_by_category(category: str, api_key: str, private_key: s
         markets = temp_api.get_active_markets_by_category(category)
         skipped_parlay = 0
         skipped_liquidity = 0
+        skipped_longshot = 0
         parlay_reasons = {}  # Track breakdown of parlay filter reasons
+
         for market in markets:
             ticker = market.get('ticker')
             if not ticker:
                 continue
+
+            # Check if this market has liquidity incentives
+            has_incentive = ticker in incentive_tickers
 
             # Filter out parlay/combo markets
             is_parlay, reason = is_parlay_or_combo_market(market)
@@ -400,15 +548,38 @@ def fetch_active_markets_by_category(category: str, api_key: str, private_key: s
                 skipped_liquidity += 1
                 continue
 
-            active_tickers.append(ticker)
-            print(f'Discovered Market: {ticker}')
-            # Log with additional context about the market
+            # Apply long shot bias filter ONLY if:
+            # 1. Filter is enabled
+            # 2. Market does NOT have liquidity incentives (incentive markets bypass this filter)
+            if longshot_filter_enabled and not has_incentive:
+                is_safe, longshot_reason = check_longshot_bias(
+                    market, longshot_price_floor, longshot_price_ceiling
+                )
+                if not is_safe:
+                    logger.debug(f"Skipping longshot market: {ticker} - {longshot_reason}")
+                    skipped_longshot += 1
+                    continue
+
+            # Market passed all filters - add to appropriate list
             title = market.get('title', 'Unknown')
             subtitle = market.get('subtitle', '')
-            logger.info(f"Discovered market: {ticker} - {title} {subtitle}".strip())
+
+            if has_incentive:
+                incentive_market_list.append(ticker)
+                print(f'Discovered INCENTIVE Market: {ticker}')
+                logger.info(f"Discovered INCENTIVE market: {ticker} - {title} {subtitle}".strip())
+            else:
+                regular_market_list.append(ticker)
+                print(f'Discovered Market: {ticker}')
+                logger.info(f"Discovered market: {ticker} - {title} {subtitle}".strip())
 
         temp_api.logout()
-        logger.info(f"Total markets found in category '{category}': {len(active_tickers)} (skipped {skipped_parlay} parlays, {skipped_liquidity} illiquid)")
+
+        total_found = len(incentive_market_list) + len(regular_market_list)
+        logger.info(f"Total markets found in category '{category}': {total_found} "
+                   f"({len(incentive_market_list)} incentive, {len(regular_market_list)} regular)")
+        logger.info(f"Skipped: {skipped_parlay} parlays, {skipped_liquidity} illiquid, {skipped_longshot} longshots")
+
         # Log breakdown of parlay filter reasons for debugging
         if parlay_reasons:
             logger.info(f"Parlay filter breakdown: {parlay_reasons}")
@@ -416,7 +587,7 @@ def fetch_active_markets_by_category(category: str, api_key: str, private_key: s
     except Exception as e:
         logger.error(f"Failed to fetch markets for category {category}: {e}")
 
-    return active_tickers
+    return incentive_market_list, regular_market_list
 
 
 def run_dynamic_strategies(config: Dict):
@@ -472,6 +643,16 @@ def run_dynamic_strategies(config: Dict):
     min_volume = liquidity_config.get('min_volume', 0)  # 0 = disabled
     max_spread_cents = liquidity_config.get('max_spread_cents', 50)  # Skip if spread > 50¢
 
+    # Long shot bias filter settings
+    longshot_config = config.get('longshot_filter', {})
+    longshot_enabled = longshot_config.get('enabled', True)
+    longshot_price_floor = longshot_config.get('price_floor_cents', 20)  # 20¢ minimum
+    longshot_price_ceiling = longshot_config.get('price_ceiling_cents', 80)  # 80¢ maximum
+
+    # Liquidity incentive settings
+    incentive_config = config.get('liquidity_incentives', {})
+    incentives_enabled = incentive_config.get('enabled', True)
+
     runner_logger.info(f"Starting dynamic market maker")
     if category:
         runner_logger.info(f"Market discovery mode: CATEGORY ('{category}')")
@@ -483,43 +664,80 @@ def run_dynamic_strategies(config: Dict):
     runner_logger.info(f"Market duration per cycle: {market_duration}s")
     runner_logger.info(f"Max concurrent markets: {max_concurrent_markets}")
     runner_logger.info(f"Liquidity filter: min_volume={min_volume}, max_spread={max_spread_cents}¢")
+    runner_logger.info(f"Long shot filter: enabled={longshot_enabled}, range={longshot_price_floor}¢-{longshot_price_ceiling}¢")
+    runner_logger.info(f"Liquidity incentives: enabled={incentives_enabled}, refresh=30min")
+    if incentives_enabled:
+        runner_logger.info(f"  Incentive markets bypass long shot filter and get priority")
 
     active_futures: Dict[str, Future] = {}
 
     with ThreadPoolExecutor(max_workers=max_concurrent_markets) as executor:
         while True:
             try:
-                # STEP 1: Fetch markets where we have positions (PRIORITY - always manage these)
+                # STEP 1: Fetch markets with liquidity incentives (cached, refreshes every 30 min)
+                incentive_tickers = set()
+                if incentives_enabled:
+                    runner_logger.info("Checking liquidity incentive markets...")
+                    incentive_tickers = get_incentive_tickers(api_key, private_key, base_url)
+                    if incentive_tickers:
+                        runner_logger.info(f"Found {len(incentive_tickers)} markets with liquidity incentives")
+
+                # STEP 2: Fetch markets where we have positions (PRIORITY - always manage these)
                 runner_logger.info("Fetching markets with existing positions...")
                 position_tickers = fetch_position_tickers(api_key, private_key, base_url)
                 if position_tickers:
                     runner_logger.info(f"Found {len(position_tickers)} markets with positions - these will be prioritized")
 
-                # STEP 2: Fetch discoverable markets using category or series approach
+                # STEP 3: Fetch discoverable markets using category or series approach
                 runner_logger.info("Fetching active markets from discovery...")
                 if category:
-                    discovered_tickers = fetch_active_markets_by_category(
-                        category, api_key, private_key, base_url, min_volume, max_spread_cents
+                    incentive_discovered, regular_discovered = fetch_active_markets_by_category(
+                        category=category,
+                        api_key=api_key,
+                        private_key=private_key,
+                        base_url=base_url,
+                        min_volume=min_volume,
+                        max_spread_cents=max_spread_cents,
+                        incentive_tickers=incentive_tickers,
+                        longshot_filter_enabled=longshot_enabled,
+                        longshot_price_floor=longshot_price_floor,
+                        longshot_price_ceiling=longshot_price_ceiling,
                     )
+                    discovered_tickers = incentive_discovered + regular_discovered
                 else:
                     discovered_tickers = fetch_active_markets(
                         series_list, api_key, private_key, base_url, min_volume, max_spread_cents
                     )
+                    incentive_discovered = []
+                    regular_discovered = discovered_tickers
 
-                # STEP 3: Combine - position markets first (priority), then discovered markets
-                # Use a list to preserve order, with position markets getting priority
+                # STEP 4: Combine with priority order:
+                # 1. Position markets (highest - must manage existing positions)
+                # 2. Incentive markets (high - get paid for resting orders)
+                # 3. Regular markets (normal)
                 active_tickers = list(position_tickers)
-                for ticker in discovered_tickers:
+
+                # Add incentive markets first (they're not in position_tickers)
+                for ticker in incentive_discovered:
                     if ticker not in position_tickers:
                         active_tickers.append(ticker)
 
+                # Add regular markets
+                for ticker in regular_discovered:
+                    if ticker not in position_tickers and ticker not in incentive_discovered:
+                        active_tickers.append(ticker)
+
                 # Log any position markets that weren't in discovered list (would have been missed)
-                missed_positions = position_tickers - set(discovered_tickers)
+                all_discovered = set(discovered_tickers)
+                missed_positions = position_tickers - all_discovered
                 if missed_positions:
                     runner_logger.warning(f"Position markets NOT in discovery (would have been missed): {missed_positions}")
                     runner_logger.info("These markets are included anyway to manage existing positions")
 
-                runner_logger.info(f"Total markets to manage: {len(active_tickers)} ({len(position_tickers)} with positions, {len(discovered_tickers)} discovered)")
+                runner_logger.info(f"Total markets to manage: {len(active_tickers)} "
+                                 f"({len(position_tickers)} with positions, "
+                                 f"{len(incentive_discovered)} incentive, "
+                                 f"{len(regular_discovered)} regular)")
 
                 # Clean up completed futures and check for exceptions
                 completed = [ticker for ticker, future in active_futures.items() if future.done()]

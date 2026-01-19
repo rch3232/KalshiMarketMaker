@@ -67,6 +67,37 @@ liquidity_filter:
   max_spread_cents: 8
 
 # =============================================================================
+# LONG SHOT BIAS FILTER
+# =============================================================================
+# Avoid trading markets with extreme prices (long shot bias)
+# Markets near 0 or 100 cents tend to be mispriced and risky
+
+longshot_filter:
+  # Enable/disable the long shot filter
+  enabled: true
+
+  # Minimum YES price in cents (skip if price < this)
+  # 20 = skip markets priced below 20¢ (highly unlikely outcomes)
+  price_floor_cents: 20
+
+  # Maximum YES price in cents (skip if price > this)
+  # 80 = skip markets priced above 80¢ (near-certain outcomes)
+  price_ceiling_cents: 80
+
+# =============================================================================
+# LIQUIDITY INCENTIVES
+# =============================================================================
+# Kalshi's Liquidity Incentive Program pays for resting orders within 2¢ of strike
+# Markets with incentives are prioritized and bypass the long shot filter
+
+liquidity_incentives:
+  # Enable fetching and prioritizing incentive markets
+  enabled: true
+
+  # Incentive markets are checked every 30 minutes (hardcoded)
+  # They get priority in the market queue and bypass longshot_filter
+
+# =============================================================================
 # MARKET MAKER PARAMETERS
 # =============================================================================
 
