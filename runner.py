@@ -10,6 +10,51 @@ from typing import Dict, List, Set
 
 from mm import KalshiTradingAPI, AvellanedaMarketMaker
 
+import re
+
+# Patterns to detect parlay/combo markets in title/subtitle
+PARLAY_KEYWORDS = re.compile(r'\b(parlay|combo|multi-leg|accumulator)\b', re.IGNORECASE)
+# Pattern to detect "X and Y" connecting different outcomes (e.g., "Team A wins and Team B wins")
+MULTI_OUTCOME_PATTERN = re.compile(r'\b\w+\s+(?:wins?|scores?|over|under)\s+and\s+\w+\s+(?:wins?|scores?|over|under)\b', re.IGNORECASE)
+
+
+def is_parlay_or_combo_market(market: Dict) -> tuple[bool, str]:
+    """Check if a market is a parlay/combo that should be skipped.
+
+    Returns:
+        tuple of (should_skip: bool, reason: str)
+    """
+    ticker = market.get('ticker', '')
+    title = market.get('title', '')
+    subtitle = market.get('subtitle', '')
+
+    # Check 1: is_combo metadata flag
+    if market.get('is_combo', False):
+        return True, "is_combo=True"
+
+    # Check 2: Ticker format - contains comma or exceeds 20 characters
+    if ',' in ticker:
+        return True, f"ticker contains comma: {ticker}"
+    if len(ticker) > 20:
+        return True, f"ticker exceeds 20 chars: {ticker}"
+
+    # Check 3: Title/subtitle contains parlay keywords
+    combined_text = f"{title} {subtitle}"
+    if PARLAY_KEYWORDS.search(combined_text):
+        return True, f"parlay keyword in title/subtitle: {combined_text[:50]}"
+
+    # Check 4: Title/subtitle contains multi-outcome pattern (e.g., "X wins and Y wins")
+    if MULTI_OUTCOME_PATTERN.search(combined_text):
+        return True, f"multi-outcome pattern in title/subtitle: {combined_text[:50]}"
+
+    # Check 5: Multiple " and " conjunctions suggesting combined bets
+    # Count occurrences of " and " that might indicate multiple legs
+    and_count = combined_text.lower().count(' and ')
+    if and_count >= 2:
+        return True, f"multiple 'and' conjunctions ({and_count}): {combined_text[:50]}"
+
+    return False, ""
+
 
 def cleanup_logger(logger: logging.Logger):
     """Properly close and remove all handlers from a logger to prevent resource leaks."""
@@ -161,16 +206,28 @@ def fetch_active_markets(series_list: List[str], api_key: str, private_key: str,
             logger=logger
         )
 
+        skipped_count = 0
         for series in series_list:
             try:
                 markets = temp_api.get_active_markets_by_series(series)
                 for market in markets:
                     ticker = market.get('ticker')
-                    if ticker:
-                        active_tickers.append(ticker)
-                        logger.info(f"Found active market: {ticker}")
+                    if not ticker:
+                        continue
+
+                    # Filter out parlay/combo markets
+                    is_parlay, reason = is_parlay_or_combo_market(market)
+                    if is_parlay:
+                        logger.info(f"Skipping parlay/combo market: {ticker} - {reason}")
+                        skipped_count += 1
+                        continue
+
+                    active_tickers.append(ticker)
+                    logger.info(f"Found active market: {ticker}")
             except Exception as e:
                 logger.error(f"Failed to fetch markets for series {series}: {e}")
+
+        logger.info(f"Total markets found: {len(active_tickers)} (skipped {skipped_count} parlay/combo markets)")
 
         temp_api.logout()
 
@@ -208,17 +265,27 @@ def fetch_active_markets_by_category(category: str, api_key: str, private_key: s
         )
 
         markets = temp_api.get_active_markets_by_category(category)
+        skipped_count = 0
         for market in markets:
             ticker = market.get('ticker')
-            if ticker:
-                active_tickers.append(ticker)
-                # Log with additional context about the market
-                title = market.get('title', 'Unknown')
-                subtitle = market.get('subtitle', '')
-                logger.info(f"Found active market: {ticker} - {title} {subtitle}".strip())
+            if not ticker:
+                continue
+
+            # Filter out parlay/combo markets
+            is_parlay, reason = is_parlay_or_combo_market(market)
+            if is_parlay:
+                logger.info(f"Skipping parlay/combo market: {ticker} - {reason}")
+                skipped_count += 1
+                continue
+
+            active_tickers.append(ticker)
+            # Log with additional context about the market
+            title = market.get('title', 'Unknown')
+            subtitle = market.get('subtitle', '')
+            logger.info(f"Found active market: {ticker} - {title} {subtitle}".strip())
 
         temp_api.logout()
-        logger.info(f"Total markets found in category '{category}': {len(active_tickers)}")
+        logger.info(f"Total markets found in category '{category}': {len(active_tickers)} (skipped {skipped_count} parlay/combo markets)")
 
     except Exception as e:
         logger.error(f"Failed to fetch markets for category {category}: {e}")
