@@ -241,7 +241,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
             self.logger.error(f"Failed to get orders: {e}")
             raise
 
-    def get_markets_by_series(self, series_ticker: str) -> List[Dict]:
+    def get_active_markets_by_series(self, series_ticker: str) -> List[Dict]:
         """Get all open markets for a series."""
         self.logger.info(f"Fetching markets for series: {series_ticker}")
         try:
