@@ -53,18 +53,21 @@ max_concurrent_markets: 10
 
 market_maker:
   # Position limits
-  max_position: 5              # Max contracts per market
+  max_position: 5              # Max contracts per side
   position_limit_buffer: 0.1   # 10% buffer near limits
 
-  # Spread settings
-  min_spread: 0.04             # $0.04 minimum spread (covers fees)
+  # Spread settings (hard adaptive caps)
+  min_spread: 0.02             # $0.02 minimum spread
+  max_spread: 0.10             # $0.10 maximum spread
 
-  # Avellaneda-Stoikov parameters
-  gamma: 0.1                   # Risk aversion (higher = wider spreads)
+  # Avellaneda-Stoikov parameters (calibrated for 0.00-1.00 probability scale)
+  gamma: 0.02                  # Risk aversion (scaled down: 0.01-0.05 range)
   k: 1.5                       # Liquidity parameter
-  sigma: 0.001                 # Volatility estimate
-  inventory_skew_factor: 0.001 # Inventory adjustment weight
+  sigma: 0.10                  # Volatility estimate for binary outcomes
+
+  # Dual-Quote flipping strategy
+  flip_skew_factor: 0.03       # Asymmetric urgency for inventory flipping
+                               # When long YES, pushes NO bid closer to mid by q*0.03
 
   # Order settings
-  order_expiration: 3600       # Orders expire after 1 hour
-  trade_side: "yes"            # Trade on "yes" side
+  order_expiration: 300        # Orders expire after 5 minutes (faster refresh)

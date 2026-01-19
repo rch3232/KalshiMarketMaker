@@ -42,19 +42,27 @@ def create_api(api_key: str, private_key: str, base_url: str, market_ticker: str
 
 
 def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.Logger):
+    """Create an AvellanedaMarketMaker with Dual-Quote flipping strategy.
+
+    Parameters are calibrated for binary probability markets (0.00-1.00 scale):
+    - gamma: Risk aversion scaled down (0.01-0.05) for decimal probabilities
+    - sigma: Volatility estimate for binary outcomes
+    - min/max_spread: Hard caps to prevent boundary-stuck quotes
+    - flip_skew_factor: Asymmetric urgency for inventory flipping
+    """
     return AvellanedaMarketMaker(
         logger=logger,
         api=api,
-        gamma=mm_config.get('gamma', 0.1),
+        gamma=mm_config.get('gamma', 0.02),
         k=mm_config.get('k', 1.5),
-        sigma=mm_config.get('sigma', 0.5),
+        sigma=mm_config.get('sigma', 0.10),
         T=mm_config.get('T', 3600),
-        max_position=mm_config.get('max_position', 100),
+        max_position=mm_config.get('max_position', 5),
         order_expiration=mm_config.get('order_expiration', 300),
-        min_spread=mm_config.get('min_spread', 0.01),
+        min_spread=mm_config.get('min_spread', 0.02),
+        max_spread=mm_config.get('max_spread', 0.10),
         position_limit_buffer=mm_config.get('position_limit_buffer', 0.1),
-        inventory_skew_factor=mm_config.get('inventory_skew_factor', 0.01),
-        trade_side=mm_config.get('trade_side', 'yes')
+        flip_skew_factor=mm_config.get('flip_skew_factor', 0.03),
     )
 
 

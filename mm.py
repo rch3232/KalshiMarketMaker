@@ -432,22 +432,33 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
 
 class AvellanedaMarketMaker:
-    """Market maker using Avellaneda-Stoikov strategy."""
+    """Market maker using Avellaneda-Stoikov strategy with Dual-Quote flipping.
+
+    This implementation is calibrated for binary probability markets (0.00 to 1.00 scale)
+    and uses a dual-quote strategy that places BUY orders on both YES and NO sides
+    to capture spread from whichever direction the market moves.
+
+    Key features:
+    - Decimal-scale aligned parameters (gamma scaled to 0.01-0.05 range)
+    - Simultaneous YES/NO bidding to capture spread from either direction
+    - Asymmetric inventory urgency for aggressive position flipping
+    - Hard adaptive caps to prevent quotes from getting stuck at boundaries
+    """
 
     def __init__(
         self,
         logger: logging.Logger,
         api: AbstractTradingAPI,
-        gamma: float = 0.1,
-        k: float = 1.5,
-        sigma: float = 0.5,
-        T: float = 3600,
-        max_position: int = 100,
-        order_expiration: int = 300,
-        min_spread: float = 0.01,
+        gamma: float = 0.02,           # Risk aversion - scaled down for 0-1 scale
+        k: float = 1.5,                # Liquidity parameter
+        sigma: float = 0.10,           # Volatility estimate for binary outcomes
+        T: float = 3600,               # Time horizon in seconds
+        max_position: int = 5,         # Max contracts per side
+        order_expiration: int = 300,   # Order TTL in seconds
+        min_spread: float = 0.02,      # Minimum spread ($0.02)
+        max_spread: float = 0.10,      # Maximum spread ($0.10)
         position_limit_buffer: float = 0.1,
-        inventory_skew_factor: float = 0.01,
-        trade_side: str = "yes",
+        flip_skew_factor: float = 0.03,  # Aggressive skew for inventory flipping
     ):
         self.logger = logger
         self.api = api
@@ -458,49 +469,147 @@ class AvellanedaMarketMaker:
         self.max_position = max_position
         self.order_expiration = order_expiration
         self.min_spread = min_spread
+        self.max_spread = max_spread
         self.position_limit_buffer = position_limit_buffer
-        self.inventory_skew_factor = inventory_skew_factor
-        self.trade_side = trade_side
+        self.flip_skew_factor = flip_skew_factor
 
         self.t = 0
-        self.active_bid_id = None
-        self.active_ask_id = None
+        self.active_yes_order_id = None
+        self.active_no_order_id = None
 
     def compute_reservation_price(self, mid_price: float, q: int, t: float) -> float:
-        """Compute reservation price with inventory adjustment."""
+        """Compute reservation price with inventory adjustment.
+
+        The reservation price is the market maker's indifference price given
+        current inventory. With positive inventory (long), the MM wants to
+        sell, so reservation price is lowered.
+
+        Formula: r(t) = S(t) - q * gamma * sigma^2 * (T - t)
+
+        For binary markets with small gamma (0.01-0.05), this provides
+        gentle pressure to reduce inventory without extreme price swings.
+        """
         time_factor = max(0.001, self.T - t)
-        r = mid_price - q * self.gamma * (self.sigma ** 2) * time_factor
+        # Scale the time factor to be reasonable for our horizon
+        normalized_time = time_factor / self.T
+        r = mid_price - q * self.gamma * (self.sigma ** 2) * normalized_time
         return r
 
     def compute_optimal_spread(self, t: float) -> float:
-        """Compute optimal spread based on Avellaneda-Stoikov model."""
+        """Compute optimal spread based on Avellaneda-Stoikov model.
+
+        Formula: delta(t) = gamma * sigma^2 * (T-t) + (2/gamma) * ln(1 + gamma/k)
+
+        The spread is clamped to [min_spread, max_spread] to ensure:
+        - We always maintain a minimum spread to cover fees
+        - We never have spreads so wide they're unfillable
+        """
         time_factor = max(0.001, self.T - t)
-        spread = self.gamma * (self.sigma ** 2) * time_factor + (2 / self.gamma) * math.log(1 + self.gamma / self.k)
-        return max(spread, self.min_spread)
+        normalized_time = time_factor / self.T
 
-    def compute_quotes(self, mid_price: float, q: int, t: float) -> Tuple[float, float]:
-        """Compute bid and ask prices."""
-        r = self.compute_reservation_price(mid_price, q, t)
+        # Time-dependent component (shrinks as T approaches)
+        time_spread = self.gamma * (self.sigma ** 2) * normalized_time
+
+        # Liquidity component (constant based on risk/liquidity tradeoff)
+        liquidity_spread = (2 / self.gamma) * math.log(1 + self.gamma / self.k)
+
+        raw_spread = time_spread + liquidity_spread
+
+        # Clamp spread to [min_spread, max_spread]
+        spread = max(self.min_spread, min(self.max_spread, raw_spread))
+
+        self.logger.debug(f"Spread calc: time={time_spread:.4f}, liq={liquidity_spread:.4f}, "
+                         f"raw={raw_spread:.4f}, clamped={spread:.4f}")
+        return spread
+
+    def compute_dual_quotes(self, yes_mid: float, q: int, t: float) -> Tuple[float, float]:
+        """Compute bid prices for both YES and NO contracts (Dual-Quote strategy).
+
+        Returns:
+            Tuple of (yes_bid_price, no_bid_price)
+
+        The dual-quote strategy places BUY orders on both sides:
+        - Buy YES at yes_bid_price
+        - Buy NO at no_bid_price
+
+        When long YES (q > 0), buying NO is equivalent to selling YES,
+        so we make the NO bid more aggressive to encourage fills that
+        reduce our YES exposure.
+
+        Asymmetric Inventory Urgency:
+        - If q > 0 (long YES): NO bid is closer to mid (aggressive), YES bid is farther
+        - If q < 0 (long NO): YES bid is closer to mid (aggressive), NO bid is farther
+        """
+        r = self.compute_reservation_price(yes_mid, q, t)
         spread = self.compute_optimal_spread(t)
+        half_spread = spread / 2
 
-        inventory_skew = q * self.inventory_skew_factor
-        bid_price = r - spread / 2 - inventory_skew
-        ask_price = r + spread / 2 - inventory_skew
+        # Base quotes around reservation price
+        base_yes_bid = r - half_spread
+        base_yes_ask = r + half_spread  # Used to derive NO bid
 
-        bid_price = max(0.01, min(0.99, round(bid_price, 2)))
-        ask_price = max(0.01, min(0.99, round(ask_price, 2)))
+        # Apply asymmetric inventory urgency (flip skew)
+        if q > 0:
+            # Long YES: want to flip by buying NO (which closes YES position)
+            # Make NO bid aggressive (closer to mid), YES bid defensive (farther from mid)
+            flip_adjustment = q * self.flip_skew_factor
+            yes_bid = base_yes_bid - flip_adjustment  # Push YES bid down (less aggressive)
+            # NO bid derived from YES ask, pushed up (more aggressive to fill)
+            no_bid = (1 - base_yes_ask) + flip_adjustment
+        elif q < 0:
+            # Long NO (short YES): want to flip by buying YES
+            # Make YES bid aggressive, NO bid defensive
+            flip_adjustment = abs(q) * self.flip_skew_factor
+            yes_bid = base_yes_bid + flip_adjustment  # Push YES bid up (more aggressive)
+            no_bid = (1 - base_yes_ask) - flip_adjustment  # Push NO bid down (less aggressive)
+        else:
+            # Neutral inventory: symmetric quotes
+            yes_bid = base_yes_bid
+            no_bid = 1 - base_yes_ask
 
-        if ask_price <= bid_price:
-            mid = (bid_price + ask_price) / 2
-            bid_price = round(mid - self.min_spread / 2, 2)
-            ask_price = round(mid + self.min_spread / 2, 2)
+        # Round to cents
+        yes_bid = round(yes_bid, 2)
+        no_bid = round(no_bid, 2)
 
-        return bid_price, ask_price
+        # Apply boundary recalculation if quotes hit extremes
+        yes_bid, no_bid = self._apply_boundary_recalculation(yes_mid, yes_bid, no_bid)
+
+        return yes_bid, no_bid
+
+    def _apply_boundary_recalculation(
+        self, yes_mid: float, yes_bid: float, no_bid: float
+    ) -> Tuple[float, float]:
+        """Apply hard adaptive caps - recalculate if quotes hit boundaries.
+
+        If the calculated quote hits 0.01 or 0.99, force recalculation
+        at mid price +/- (min_spread / 2) to ensure competitive, fillable orders.
+        """
+        no_mid = 1 - yes_mid
+
+        # Check YES bid against boundaries
+        if yes_bid <= 0.01 or yes_bid >= 0.99:
+            # Force YES bid to be competitive around mid
+            yes_bid = round(yes_mid - self.min_spread / 2, 2)
+            self.logger.info(f"YES bid hit boundary, recalculated to ${yes_bid:.2f}")
+
+        # Check NO bid against boundaries
+        if no_bid <= 0.01 or no_bid >= 0.99:
+            # Force NO bid to be competitive around mid
+            no_bid = round(no_mid - self.min_spread / 2, 2)
+            self.logger.info(f"NO bid hit boundary, recalculated to ${no_bid:.2f}")
+
+        # Final clamp to valid range [0.02, 0.98] to stay off the book edges
+        yes_bid = max(0.02, min(0.98, yes_bid))
+        no_bid = max(0.02, min(0.98, no_bid))
+
+        return yes_bid, no_bid
 
     def cancel_existing_orders(self):
-        """Cancel all existing orders."""
+        """Cancel all existing orders to ensure fresh quotes at BBO."""
         try:
             orders = self.api.get_orders()
+            if orders:
+                self.logger.info(f"Canceling {len(orders)} existing orders")
             for order in orders:
                 order_id = order.get("order_id")
                 if order_id:
@@ -512,29 +621,54 @@ class AvellanedaMarketMaker:
             self.logger.error(f"Failed to get orders for cancellation: {e}")
 
     def run_iteration(self, dt: float):
-        """Run one iteration of the market making loop."""
+        """Run one iteration of the market making loop.
+
+        Each iteration:
+        1. Fetches current market prices
+        2. Gets current inventory position
+        3. Cancels ALL existing orders (ensures we're always at BBO)
+        4. Computes new dual quotes with inventory urgency
+        5. Places BUY orders on both YES and NO sides
+        """
         try:
+            # Get current market state
             price_data = self.api.get_price()
-            mid_price = price_data[self.trade_side]
+            yes_mid = price_data["yes"]
+            no_mid = price_data["no"]
             q = self.api.get_position()
 
+            # Cancel all existing orders first (order management requirement)
             self.cancel_existing_orders()
 
-            bid_price, ask_price = self.compute_quotes(mid_price, q, self.t)
+            # Compute dual quotes with asymmetric inventory urgency
+            yes_bid, no_bid = self.compute_dual_quotes(yes_mid, q, self.t)
 
-            self.logger.info(f"Mid price: ${mid_price:.2f}, Position: {q}")
-            self.logger.info(f"Computed bid: ${bid_price:.2f}, ask: ${ask_price:.2f}")
+            self.logger.info(f"Market: YES mid=${yes_mid:.2f}, NO mid=${no_mid:.2f}")
+            self.logger.info(f"Position: {q} | Quotes: BUY YES @${yes_bid:.2f}, BUY NO @${no_bid:.2f}")
 
             position_limit = int(self.max_position * (1 - self.position_limit_buffer))
             expiration_ts = int(time.time()) + self.order_expiration
 
+            # Place BUY YES order (if not at max long position)
             if q < position_limit:
-                self.logger.info(f"Placing bid at ${bid_price:.2f}")
-                self.api.place_order("buy", self.trade_side, bid_price, 1, expiration_ts)
+                self.logger.info(f"Placing BUY YES at ${yes_bid:.2f}")
+                try:
+                    self.active_yes_order_id = self.api.place_order(
+                        "buy", "yes", yes_bid, 1, expiration_ts
+                    )
+                except Exception as e:
+                    self.logger.error(f"Failed to place YES order: {e}")
 
+            # Place BUY NO order (effectively a sell YES when filled)
+            # Only place if we have room in position or need to reduce YES exposure
             if q > -position_limit:
-                self.logger.info(f"Placing ask at ${ask_price:.2f}")
-                self.api.place_order("sell", self.trade_side, ask_price, 1, expiration_ts)
+                self.logger.info(f"Placing BUY NO at ${no_bid:.2f}")
+                try:
+                    self.active_no_order_id = self.api.place_order(
+                        "buy", "no", no_bid, 1, expiration_ts
+                    )
+                except Exception as e:
+                    self.logger.error(f"Failed to place NO order: {e}")
 
             self.t += dt
 
@@ -544,7 +678,10 @@ class AvellanedaMarketMaker:
 
     def run(self, dt: float):
         """Run the market maker loop until T is reached."""
-        self.logger.info(f"Starting market maker loop (T={self.T}s, dt={dt}s)")
+        self.logger.info(f"Starting Dual-Quote market maker (T={self.T}s, dt={dt}s)")
+        self.logger.info(f"Parameters: gamma={self.gamma}, sigma={self.sigma}, "
+                        f"spread=[{self.min_spread:.2f}, {self.max_spread:.2f}], "
+                        f"flip_skew={self.flip_skew_factor}")
         while self.t < self.T:
             self.run_iteration(dt)
             time.sleep(dt)
