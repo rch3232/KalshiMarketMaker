@@ -1243,7 +1243,9 @@ class AvellanedaMarketMaker:
             api_orders_by_side = {'yes': None, 'no': None}
             for order in api_orders:
                 side = order.get('side', '')
-                if side in ('yes', 'no') and order.get('action') == 'buy':
+                order_id = order.get('order_id')
+                # Skip orders without valid order_id or that aren't buy orders
+                if side in ('yes', 'no') and order.get('action') == 'buy' and order_id:
                     # Get price - check both cents and dollars formats
                     if side == 'yes':
                         price = order.get('yes_price', 0) / 100.0
@@ -1255,7 +1257,7 @@ class AvellanedaMarketMaker:
                             price = float(order['no_price_dollars'])
 
                     api_orders_by_side[side] = {
-                        'order_id': order.get('order_id'),
+                        'order_id': order_id,
                         'price': price,
                         'side': side,
                         'count': order.get('remaining_count', 1),
@@ -1272,7 +1274,7 @@ class AvellanedaMarketMaker:
                     if tracked:
                         self.logger.debug(f"Order for {side} side no longer exists, clearing tracking")
                     self.tracked_orders[side] = None
-                elif tracked is None or tracked['order_id'] != api_order['order_id']:
+                elif tracked is None or tracked.get('order_id') != api_order.get('order_id'):
                     # New order or different order - update tracking
                     # Parse created_time if it's a string
                     created_at = api_order['created_at']
@@ -1324,8 +1326,11 @@ class AvellanedaMarketMaker:
         # Log current order state for diagnostics
         yes_tracked = self.tracked_orders.get('yes')
         no_tracked = self.tracked_orders.get('no')
-        self.logger.info(f"ORDER STATE: YES={yes_tracked['order_id'][:8] if yes_tracked else 'none'}@${yes_tracked['price']:.2f if yes_tracked else 0}, "
-                        f"NO={no_tracked['order_id'][:8] if no_tracked else 'none'}@${no_tracked['price']:.2f if no_tracked else 0}")
+        yes_id = yes_tracked['order_id'][:8] if yes_tracked and yes_tracked.get('order_id') else 'none'
+        no_id = no_tracked['order_id'][:8] if no_tracked and no_tracked.get('order_id') else 'none'
+        yes_price = yes_tracked['price'] if yes_tracked and yes_tracked.get('price') is not None else 0
+        no_price = no_tracked['price'] if no_tracked and no_tracked.get('price') is not None else 0
+        self.logger.info(f"ORDER STATE: YES={yes_id}@${yes_price:.2f}, NO={no_id}@${no_price:.2f}")
 
         # Check for cross-market conflicts
         yes_blocked = self.position_tracker.is_buy_blocked(self.market_ticker, 'yes')
@@ -1366,8 +1371,8 @@ class AvellanedaMarketMaker:
         """
         tracked = self.tracked_orders.get(side)
 
-        if tracked is None:
-            # No existing order - place new one
+        if tracked is None or not tracked.get('order_id'):
+            # No existing order or invalid order_id - place new one
             self.logger.info(f"No existing {side.upper()} order, placing at ${desired_price:.3f}")
             self._place_order(side, desired_price, desired_count, expiration_ts)
             return
