@@ -630,6 +630,30 @@ class KalshiTradingAPI(AbstractTradingAPI):
             self.logger.error(f"Failed to fetch markets for series {series_ticker}: {e}")
             raise
 
+    def get_portfolio_positions(self) -> List[Dict]:
+        """Get all positions in the portfolio.
+
+        Returns a list of position dictionaries containing:
+        - ticker: Market ticker
+        - position: Net position (positive = long YES, negative = long NO)
+        - market_exposure: Total exposure in cents
+        - And other position metadata
+
+        This is used to ensure we manage ALL positions, not just ones we discover
+        through market filters.
+        """
+        self.logger.info("Fetching all portfolio positions...")
+        try:
+            response = self._make_request("GET", "/portfolio/positions")
+            positions = response.get("market_positions", [])
+            # Filter to only positions with non-zero holdings
+            active_positions = [p for p in positions if p.get("position", 0) != 0]
+            self.logger.info(f"Found {len(active_positions)} active positions in portfolio")
+            return active_positions
+        except Exception as e:
+            self.logger.error(f"Failed to get portfolio positions: {e}")
+            return []
+
     def get_active_markets_by_category(self, category: str = "Sports", max_markets: int = 500) -> List[Dict]:
         """Get open markets for a category (e.g., 'Sports').
 

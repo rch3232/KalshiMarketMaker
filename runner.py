@@ -281,6 +281,45 @@ def fetch_active_markets(series_list: List[str], api_key: str, private_key: str,
     return active_tickers
 
 
+def fetch_position_tickers(api_key: str, private_key: str, base_url: str) -> Set[str]:
+    """Fetch all market tickers where the user has active positions.
+
+    These markets will be included in the trading list regardless of liquidity
+    filters to ensure we manage ALL positions (place sell orders, etc.).
+
+    Returns:
+        Set of ticker strings for markets with non-zero positions
+    """
+    logger = logging.getLogger("PositionFetcher")
+    position_tickers: Set[str] = set()
+
+    try:
+        temp_api = KalshiTradingAPI(
+            api_key=api_key,
+            private_key=private_key,
+            market_ticker="DUMMY",
+            base_url=base_url,
+            logger=logger
+        )
+
+        positions = temp_api.get_portfolio_positions()
+        for pos in positions:
+            ticker = pos.get('ticker')
+            if ticker:
+                position = pos.get('position', 0)
+                position_tickers.add(ticker)
+                side = "YES" if position > 0 else "NO"
+                logger.info(f"Found position in {ticker}: {abs(position)} {side}")
+
+        temp_api.logout()
+        logger.info(f"Total markets with positions: {len(position_tickers)}")
+
+    except Exception as e:
+        logger.error(f"Failed to fetch position tickers: {e}")
+
+    return position_tickers
+
+
 def fetch_active_markets_by_category(category: str, api_key: str, private_key: str, base_url: str,
                                       min_volume: int = 0, max_spread_cents: int = 50) -> List[str]:
     """Fetch all active market tickers for a category (e.g., 'Sports').
@@ -426,17 +465,37 @@ def run_dynamic_strategies(config: Dict):
     with ThreadPoolExecutor(max_workers=max_concurrent_markets) as executor:
         while True:
             try:
-                # Fetch current active markets using category or series approach
-                runner_logger.info("Fetching active markets...")
+                # STEP 1: Fetch markets where we have positions (PRIORITY - always manage these)
+                runner_logger.info("Fetching markets with existing positions...")
+                position_tickers = fetch_position_tickers(api_key, private_key, base_url)
+                if position_tickers:
+                    runner_logger.info(f"Found {len(position_tickers)} markets with positions - these will be prioritized")
+
+                # STEP 2: Fetch discoverable markets using category or series approach
+                runner_logger.info("Fetching active markets from discovery...")
                 if category:
-                    active_tickers = fetch_active_markets_by_category(
+                    discovered_tickers = fetch_active_markets_by_category(
                         category, api_key, private_key, base_url, min_volume, max_spread_cents
                     )
                 else:
-                    active_tickers = fetch_active_markets(
+                    discovered_tickers = fetch_active_markets(
                         series_list, api_key, private_key, base_url, min_volume, max_spread_cents
                     )
-                runner_logger.info(f"Found {len(active_tickers)} active markets")
+
+                # STEP 3: Combine - position markets first (priority), then discovered markets
+                # Use a list to preserve order, with position markets getting priority
+                active_tickers = list(position_tickers)
+                for ticker in discovered_tickers:
+                    if ticker not in position_tickers:
+                        active_tickers.append(ticker)
+
+                # Log any position markets that weren't in discovered list (would have been missed)
+                missed_positions = position_tickers - set(discovered_tickers)
+                if missed_positions:
+                    runner_logger.warning(f"Position markets NOT in discovery (would have been missed): {missed_positions}")
+                    runner_logger.info("These markets are included anyway to manage existing positions")
+
+                runner_logger.info(f"Total markets to manage: {len(active_tickers)} ({len(position_tickers)} with positions, {len(discovered_tickers)} discovered)")
 
                 # Clean up completed futures and check for exceptions
                 completed = [ticker for ticker, future in active_futures.items() if future.done()]
