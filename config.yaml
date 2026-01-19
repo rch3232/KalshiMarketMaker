@@ -49,7 +49,7 @@ dt: 2.0
 
 # Maximum number of markets to trade simultaneously
 # Higher value allows managing positions while still discovering new markets
-max_concurrent_markets: 30
+max_concurrent_markets: 100
 
 # =============================================================================
 # LIQUIDITY FILTER
