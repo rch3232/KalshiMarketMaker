@@ -376,7 +376,15 @@ class KalshiTradingAPI(AbstractTradingAPI):
             no_mid_price = round(1 - yes_mid_price, 2)
 
             self.logger.info(f"Market mid-prices: YES=${yes_mid_price:.2f}, NO=${no_mid_price:.2f}")
-            return {"yes": yes_mid_price, "no": no_mid_price}
+            self.logger.info(f"Market bid/ask: YES bid=${yes_bid:.2f}, YES ask=${yes_ask:.2f}")
+            return {
+                "yes": yes_mid_price,
+                "no": no_mid_price,
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "no_bid": no_bid,
+                "no_ask": no_ask,
+            }
         except Exception as e:
             self.logger.error(f"Failed to get price: {e}")
             raise
@@ -590,7 +598,16 @@ class AvellanedaMarketMaker:
                          f"raw={raw_spread:.4f}, clamped={spread:.4f}")
         return spread
 
-    def compute_dual_quotes(self, yes_mid: float, q: int, t: float) -> Tuple[float, float]:
+    def compute_dual_quotes(
+        self,
+        yes_mid: float,
+        q: int,
+        t: float,
+        market_yes_bid: float = 0,
+        market_yes_ask: float = 0,
+        market_no_bid: float = 0,
+        market_no_ask: float = 0,
+    ) -> Tuple[float, float]:
         """Compute bid prices for both YES and NO contracts (Dual-Quote strategy).
 
         Returns:
@@ -607,6 +624,9 @@ class AvellanedaMarketMaker:
         Asymmetric Inventory Urgency:
         - If q > 0 (long YES): NO bid is closer to mid (aggressive), YES bid is farther
         - If q < 0 (long NO): YES bid is closer to mid (aggressive), NO bid is farther
+
+        Market bid/ask values are used to ensure our bids are competitive - we
+        bid at least at the current market bid level to have a chance of getting filled.
         """
         r = self.compute_reservation_price(yes_mid, q, t)
         spread = self.compute_optimal_spread(t)
@@ -639,31 +659,62 @@ class AvellanedaMarketMaker:
         yes_bid = round(yes_bid, 2)
         no_bid = round(no_bid, 2)
 
+        # Ensure competitive pricing: bids must be at least at current market bid
+        # to join the queue and have a chance of getting filled.
+        # Bidding below the market bid means our order sits behind existing bidders
+        # and will likely never fill.
+        if market_yes_bid > 0 and yes_bid < market_yes_bid:
+            self.logger.info(
+                f"YES bid ${yes_bid:.2f} below market bid ${market_yes_bid:.2f}, "
+                f"raising to market bid"
+            )
+            yes_bid = market_yes_bid
+
+        if market_no_bid > 0 and no_bid < market_no_bid:
+            self.logger.info(
+                f"NO bid ${no_bid:.2f} below market bid ${market_no_bid:.2f}, "
+                f"raising to market bid"
+            )
+            no_bid = market_no_bid
+
         # Apply boundary recalculation if quotes hit extremes
-        yes_bid, no_bid = self._apply_boundary_recalculation(yes_mid, yes_bid, no_bid)
+        yes_bid, no_bid = self._apply_boundary_recalculation(
+            yes_mid, yes_bid, no_bid, market_yes_bid, market_no_bid
+        )
 
         return yes_bid, no_bid
 
     def _apply_boundary_recalculation(
-        self, yes_mid: float, yes_bid: float, no_bid: float
+        self,
+        yes_mid: float,
+        yes_bid: float,
+        no_bid: float,
+        market_yes_bid: float = 0,
+        market_no_bid: float = 0,
     ) -> Tuple[float, float]:
         """Apply hard adaptive caps - recalculate if quotes hit boundaries.
 
         If the calculated quote hits 0.01 or 0.99, force recalculation
-        at mid price +/- (min_spread / 2) to ensure competitive, fillable orders.
+        to the current market bid to ensure competitive, fillable orders.
         """
         no_mid = 1 - yes_mid
 
         # Check YES bid against boundaries
         if yes_bid <= 0.01 or yes_bid >= 0.99:
-            # Force YES bid to be competitive around mid
-            yes_bid = round(yes_mid - self.min_spread / 2, 2)
+            # Use market bid if available, otherwise fall back to mid-based calculation
+            if market_yes_bid > 0:
+                yes_bid = market_yes_bid
+            else:
+                yes_bid = round(yes_mid - self.min_spread / 2, 2)
             self.logger.info(f"YES bid hit boundary, recalculated to ${yes_bid:.2f}")
 
         # Check NO bid against boundaries
         if no_bid <= 0.01 or no_bid >= 0.99:
-            # Force NO bid to be competitive around mid
-            no_bid = round(no_mid - self.min_spread / 2, 2)
+            # Use market bid if available, otherwise fall back to mid-based calculation
+            if market_no_bid > 0:
+                no_bid = market_no_bid
+            else:
+                no_bid = round(no_mid - self.min_spread / 2, 2)
             self.logger.info(f"NO bid hit boundary, recalculated to ${no_bid:.2f}")
 
         # Final clamp to valid range [0.02, 0.98] to stay off the book edges
@@ -703,13 +754,23 @@ class AvellanedaMarketMaker:
             price_data = self.api.get_price()
             yes_mid = price_data["yes"]
             no_mid = price_data["no"]
+            market_yes_bid = price_data["yes_bid"]
+            market_yes_ask = price_data["yes_ask"]
+            market_no_bid = price_data["no_bid"]
+            market_no_ask = price_data["no_ask"]
             q = self.api.get_position()
 
             # Cancel all existing orders first (order management requirement)
             self.cancel_existing_orders()
 
             # Compute dual quotes with asymmetric inventory urgency
-            yes_bid, no_bid = self.compute_dual_quotes(yes_mid, q, self.t)
+            yes_bid, no_bid = self.compute_dual_quotes(
+                yes_mid, q, self.t,
+                market_yes_bid=market_yes_bid,
+                market_yes_ask=market_yes_ask,
+                market_no_bid=market_no_bid,
+                market_no_ask=market_no_ask,
+            )
 
             self.logger.info(f"Market: YES mid=${yes_mid:.2f}, NO mid=${no_mid:.2f}")
             self.logger.info(f"Position: {q} | Quotes: BUY YES @${yes_bid:.2f}, BUY NO @${no_bid:.2f}")
