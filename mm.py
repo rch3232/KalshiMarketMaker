@@ -106,14 +106,18 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
     def _make_request(self, method: str, endpoint: str, data: dict = None) -> dict:
         """Make an authenticated request to the Kalshi API."""
-        # Build full URL and path for signing
+        # Build full URL
         url = f"{self.base_url}{endpoint}"
 
         # Generate timestamp in milliseconds
         timestamp_ms = int(time.time() * 1000)
 
-        # Sign the request (path includes query params for GET)
-        signature = self._sign_request(method.upper(), endpoint, timestamp_ms)
+        # For signing: strip query params and prepend /trade-api/v2
+        path_for_signing = endpoint.split('?')[0]  # Remove query params
+        path_for_signing = f"/trade-api/v2{path_for_signing}"  # Add API prefix
+
+        self.logger.info(f"Signing path: {path_for_signing}")
+        signature = self._sign_request(method.upper(), path_for_signing, timestamp_ms)
 
         headers = {
             "Content-Type": "application/json",
