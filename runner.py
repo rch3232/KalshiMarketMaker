@@ -22,10 +22,10 @@ def load_config(config_file):
         return yaml.safe_load(f)
 
 
-def create_api(email: str, password: str, base_url: str, market_ticker: str, logger: logging.Logger):
+def create_api(api_key: str, private_key: str, base_url: str, market_ticker: str, logger: logging.Logger):
     return KalshiTradingAPI(
-        email=email,
-        password=password,
+        api_key=api_key,
+        private_key=private_key,
         market_ticker=market_ticker,
         base_url=base_url,
         logger=logger,
@@ -51,8 +51,8 @@ def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.
 
 def run_market_for_duration(
     market_ticker: str,
-    email: str,
-    password: str,
+    api_key: str,
+    private_key: str,
     base_url: str,
     mm_config: Dict,
     dt: float,
@@ -77,7 +77,7 @@ def run_market_for_duration(
     logger.info(f"Starting market maker for {market_ticker}")
 
     try:
-        api = create_api(email, password, base_url, market_ticker, logger)
+        api = create_api(api_key, private_key, base_url, market_ticker, logger)
 
         # Override T with the duration for this run cycle
         config_with_duration = mm_config.copy()
@@ -97,7 +97,7 @@ def run_market_for_duration(
     logger.info(f"Market maker for {market_ticker} finished")
 
 
-def fetch_active_markets(series_list: List[str], email: str, password: str, base_url: str) -> List[str]:
+def fetch_active_markets(series_list: List[str], api_key: str, private_key: str, base_url: str) -> List[str]:
     """Fetch all active market tickers for the given series list."""
     logger = logging.getLogger("MarketFetcher")
     active_tickers = []
@@ -106,8 +106,8 @@ def fetch_active_markets(series_list: List[str], email: str, password: str, base
     # We use a dummy ticker since we just need to be authenticated
     try:
         temp_api = KalshiTradingAPI(
-            email=email,
-            password=password,
+            api_key=api_key,
+            private_key=private_key,
             market_ticker="DUMMY",
             base_url=base_url,
             logger=logger
@@ -140,13 +140,16 @@ def run_dynamic_strategies(config: Dict):
     3. Handles market expiration gracefully
     4. Refreshes market list periodically
     """
-    email = os.getenv("KALSHI_EMAIL")
-    password = os.getenv("KALSHI_PASSWORD")
+    api_key = os.getenv("KALSHI_API_KEY")
+    private_key = os.getenv("KALSHI_PRIVATE_KEY")
     base_url = os.getenv("KALSHI_BASE_URL")
 
-    if not all([email, password, base_url]):
-        runner_logger.error("Missing required environment variables: KALSHI_EMAIL, KALSHI_PASSWORD, KALSHI_BASE_URL")
+    if not all([api_key, private_key, base_url]):
+        runner_logger.error("Missing required environment variables: KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_BASE_URL")
         return
+
+    # Handle newlines in private key (environment variables often escape them)
+    private_key = private_key.replace('\\n', '\n')
 
     # Extract configuration
     series_list = config.get('series', [])
@@ -169,7 +172,7 @@ def run_dynamic_strategies(config: Dict):
             try:
                 # Fetch current active markets
                 runner_logger.info("Fetching active markets...")
-                active_tickers = fetch_active_markets(series_list, email, password, base_url)
+                active_tickers = fetch_active_markets(series_list, api_key, private_key, base_url)
                 runner_logger.info(f"Found {len(active_tickers)} active markets")
 
                 # Clean up completed futures
@@ -185,8 +188,8 @@ def run_dynamic_strategies(config: Dict):
                         future = executor.submit(
                             run_market_for_duration,
                             ticker,
-                            email,
-                            password,
+                            api_key,
+                            private_key,
                             base_url,
                             mm_config,
                             dt,
@@ -226,9 +229,14 @@ def run_static_strategy(config_name: str, config: Dict):
 
     logger.info(f"Starting strategy: {config_name}")
 
+    # Handle newlines in private key
+    private_key = os.getenv("KALSHI_PRIVATE_KEY")
+    if private_key:
+        private_key = private_key.replace('\\n', '\n')
+
     api = KalshiTradingAPI(
-        email=os.getenv("KALSHI_EMAIL"),
-        password=os.getenv("KALSHI_PASSWORD"),
+        api_key=os.getenv("KALSHI_API_KEY"),
+        private_key=private_key,
         market_ticker=config['api']['market_ticker'],
         base_url=os.getenv("KALSHI_BASE_URL"),
         logger=logger,
