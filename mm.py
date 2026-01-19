@@ -1877,10 +1877,18 @@ class AvellanedaMarketMaker:
                 # CRITICAL: Sync tracked orders before reconciling (was missing before!)
                 self._sync_tracked_orders()
 
-                opposite_side = 'no' if self.pending_exit['side'] == 'yes' else 'yes'
+                owned_side = self.pending_exit['side']
+                opposite_side = 'no' if owned_side == 'yes' else 'yes'
                 opposite_price = no_bid if opposite_side == 'no' else yes_bid
 
                 self.logger.info(f"DUAL EXIT MODE: Synced orders, placing {opposite_side.upper()} bid @ ${opposite_price:.2f}")
+
+                # CRITICAL: Cancel any BUY orders on the OWNED side
+                # This ensures we don't have both SELL and BUY on the same side
+                # (BUY orders may linger from before entering dual exit mode)
+                if self.tracked_orders.get(owned_side):
+                    self.logger.info(f"DUAL EXIT: Canceling stale {owned_side.upper()} BUY order (should only have SELL)")
+                    self._cancel_side_if_exists(owned_side)
 
                 # Only reconcile opposite side - the owned side has a SELL order, not a BUY
                 self._reconcile_side(opposite_side, opposite_price, 1, int(time.time()) + self.order_expiration, time.time())
