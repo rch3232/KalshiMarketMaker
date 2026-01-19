@@ -296,6 +296,57 @@ class KalshiTradingAPI(AbstractTradingAPI):
             self.logger.error(f"Failed to get position: {e}")
             raise
 
+    def get_position_with_cost(self) -> Dict:
+        """Get position with cost basis information.
+
+        Returns a dict with:
+        - position: int (positive = long YES, negative = long NO)
+        - yes_cost: float (average cost of YES position in dollars, 0 if no YES position)
+        - no_cost: float (average cost of NO position in dollars, 0 if no NO position)
+        """
+        self.logger.info("Retrieving position with cost basis...")
+        try:
+            response = self._make_request("GET", f"/portfolio/positions?ticker={self.market_ticker}")
+            positions = response.get("market_positions", [])
+
+            result = {"position": 0, "yes_cost": 0.0, "no_cost": 0.0}
+
+            for pos in positions:
+                if pos.get("ticker") == self.market_ticker:
+                    result["position"] += pos.get("position", 0)
+
+                    # Kalshi API returns costs in cents
+                    # market_exposure is total cost, resting_orders_count for pending
+                    # For cost basis, we use the realized_pnl info or calculate from exposure
+                    # The API may return: total_traded, fees_paid, etc.
+                    # Most reliable: use market_exposure / abs(position) if available
+
+                    # Check for YES position cost
+                    yes_qty = pos.get("yes_position", 0) or pos.get("position", 0)
+                    if yes_qty > 0:
+                        # market_exposure is total dollars spent (in cents)
+                        exposure_cents = pos.get("market_exposure", 0)
+                        if exposure_cents and yes_qty > 0:
+                            result["yes_cost"] = round(exposure_cents / 100 / yes_qty, 2)
+                        # Fallback: check for average_buy_price if available
+                        avg_price = pos.get("average_buy_price")
+                        if avg_price:
+                            result["yes_cost"] = round(avg_price / 100, 2)
+
+                    # Check for NO position cost (position < 0 means long NO)
+                    no_qty = pos.get("no_position", 0)
+                    if no_qty and no_qty > 0:
+                        exposure_cents = pos.get("market_exposure", 0)
+                        if exposure_cents and no_qty > 0:
+                            result["no_cost"] = round(exposure_cents / 100 / no_qty, 2)
+
+            self.logger.info(f"Position: {result['position']}, YES cost: ${result['yes_cost']:.2f}, "
+                           f"NO cost: ${result['no_cost']:.2f}")
+            return result
+        except Exception as e:
+            self.logger.error(f"Failed to get position with cost: {e}")
+            raise
+
     def get_price(self) -> Dict[str, float]:
         self.logger.info("Retrieving market data...")
         try:
@@ -743,8 +794,23 @@ class AvellanedaMarketMaker:
         Returns True if a new fill was detected that requires tracking.
         """
         if self.last_position is None:
-            # First iteration - just record position, no fill detection
+            # First iteration - record position
             self.last_position = current_position
+
+            # If we're starting with an existing position, set up exit tracking
+            # so we properly manage selling above cost
+            if current_position != 0 and self.pending_exit is None:
+                fill_side = 'yes' if current_position > 0 else 'no'
+                # Use bid price as placeholder - actual cost will be fetched from API when exiting
+                entry_price = yes_bid if current_position > 0 else no_bid
+                self.pending_exit = {
+                    'side': fill_side,
+                    'entry_price': entry_price,
+                    'fill_time': time.time(),  # Start timeout from now
+                    'quantity': abs(current_position),
+                }
+                self.logger.info(f"STARTUP: Detected existing {fill_side.upper()} position ({current_position}), "
+                               f"setting up exit tracking (actual cost will be fetched from API)")
             return False
 
         position_delta = current_position - self.last_position
@@ -801,8 +867,12 @@ class AvellanedaMarketMaker:
         self.last_position = current_position
         return True
 
-    def check_and_place_exit_order(self, current_position: int) -> bool:
+    def check_and_place_exit_order(self, current_position: int, yes_mid: float = 0.50) -> bool:
         """Check if we need to place an exit order and do so if timeout exceeded.
+
+        The exit price is calculated as max(cost_basis + 0.01, mid_price) to:
+        1. Always ensure at least 1 cent profit above our actual cost
+        2. Take advantage of favorable market conditions when mid > cost + 1 cent
 
         Returns True if an exit order was placed.
         """
@@ -823,19 +893,52 @@ class AvellanedaMarketMaker:
             return False
 
         # Timeout exceeded - place exit order
-        entry_price = self.pending_exit['entry_price']
-        exit_price = round(entry_price + self.exit_profit_target, 2)
+        # Get actual cost basis from the API instead of using tracked entry_price
+        pending_side = self.pending_exit['side']
+
+        try:
+            position_info = self.api.get_position_with_cost()
+            if pending_side == 'yes':
+                cost_basis = position_info.get('yes_cost', 0)
+            else:
+                cost_basis = position_info.get('no_cost', 0)
+        except Exception as e:
+            self.logger.warning(f"Could not get cost basis from API: {e}, using tracked entry price")
+            cost_basis = 0
+
+        # Fall back to tracked entry_price if cost basis unavailable
+        if cost_basis <= 0:
+            cost_basis = self.pending_exit['entry_price']
+            self.logger.info(f"Using tracked entry price as cost basis: ${cost_basis:.2f}")
+        else:
+            self.logger.info(f"Got actual cost basis from API: ${cost_basis:.2f}")
+
+        # Calculate exit price: max(cost + 1 cent, mid price)
+        # This ensures we always profit and take advantage of favorable mid
+        min_exit_price = cost_basis + 0.01  # At least 1 cent above cost
+
+        if pending_side == 'yes':
+            # Selling YES - use YES mid price
+            mid_for_exit = yes_mid
+        else:
+            # Selling NO - use NO mid price (1 - yes_mid)
+            mid_for_exit = 1 - yes_mid
+
+        # Use the higher of minimum profitable price or current mid
+        exit_price = round(max(min_exit_price, mid_for_exit), 2)
 
         # Clamp to valid range
         exit_price = max(0.02, min(0.98, exit_price))
 
-        pending_side = self.pending_exit['side']
+        self.logger.info(f"Exit price calculation: cost=${cost_basis:.2f}, min_exit=${min_exit_price:.2f}, "
+                        f"mid=${mid_for_exit:.2f}, final=${exit_price:.2f}")
+
         # Determine order parameters for exiting
         # If we bought YES (pending_side='yes', position>0), we SELL YES
         # If we bought NO (pending_side='no', position<0), we SELL NO
         if pending_side == 'yes' and current_position > 0:
             self.logger.info(f"AUTO-EXIT: Placing SELL YES @ ${exit_price:.2f} "
-                           f"(entry=${entry_price:.2f}, profit target=${self.exit_profit_target:.2f})")
+                           f"(cost=${cost_basis:.2f}, min profit=1¢)")
             try:
                 # Cancel existing orders first to avoid conflicts
                 self.cancel_existing_orders()
@@ -849,7 +952,7 @@ class AvellanedaMarketMaker:
                 return False
         elif pending_side == 'no' and current_position < 0:
             self.logger.info(f"AUTO-EXIT: Placing SELL NO @ ${exit_price:.2f} "
-                           f"(entry=${entry_price:.2f}, profit target=${self.exit_profit_target:.2f})")
+                           f"(cost=${cost_basis:.2f}, min profit=1¢)")
             try:
                 # Cancel existing orders first to avoid conflicts
                 self.cancel_existing_orders()
@@ -919,7 +1022,7 @@ class AvellanedaMarketMaker:
             self.detect_fill_and_track(q, yes_bid, no_bid)
 
             # Check if we need to exit (timeout exceeded)
-            if self.check_and_place_exit_order(q):
+            if self.check_and_place_exit_order(q, yes_mid):
                 # Exit order placed - skip normal market making this iteration
                 # We'll continue normal operation once position is flat
                 self.logger.info("In exit mode - waiting for exit order to fill")
