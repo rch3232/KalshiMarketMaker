@@ -1,14 +1,13 @@
 import abc
 import time
-import base64
 from typing import Dict, List, Tuple
-import requests
 import logging
 import uuid
 import math
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.backends import default_backend
+
+# Use official Kalshi Python client for authentication
+from kalshi_python import Configuration
+from kalshi_python.client import KalshiClient
 
 
 class AbstractTradingAPI(abc.ABC):
@@ -47,114 +46,18 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.logger = logger
         self.base_url = base_url
 
-        # Extract the path prefix from base_url for signing
-        # e.g., "https://api.elections.kalshi.com/trade-api/v2" -> "/trade-api/v2"
-        from urllib.parse import urlparse
-        parsed = urlparse(base_url)
-        self.path_prefix = parsed.path.rstrip('/')  # e.g., "/trade-api/v2"
-
-        # Load the private key
-        self.private_key = self._load_private_key(private_key)
-        self.logger.info("API key authentication initialized")
-
-    def _load_private_key(self, private_key_str: str):
-        """Load RSA private key from PEM string."""
         # Handle escaped newlines from environment variables
-        private_key_str = private_key_str.replace('\\n', '\n')
+        private_key = private_key.replace('\\n', '\n')
 
-        # Handle the private key - it might be a file path or the key itself
-        if private_key_str.startswith('-----BEGIN'):
-            # It's already a PEM string
-            key_data = private_key_str.encode('utf-8')
-        elif '-----BEGIN' in private_key_str:
-            # PEM markers are present but not at start - clean it up
-            key_data = private_key_str.encode('utf-8')
-        else:
-            # Try to read as file path
-            try:
-                with open(private_key_str, 'rb') as f:
-                    key_data = f.read()
-            except (FileNotFoundError, OSError):
-                # Assume it's base64 encoded key content without PEM headers
-                # Try to reconstruct PEM format
-                clean_key = private_key_str.replace(' ', '').replace('\n', '')
-                # Add PEM headers and format with 64-char lines
-                lines = [clean_key[i:i+64] for i in range(0, len(clean_key), 64)]
-                pem_key = '-----BEGIN RSA PRIVATE KEY-----\n' + '\n'.join(lines) + '\n-----END RSA PRIVATE KEY-----'
-                key_data = pem_key.encode('utf-8')
+        # Configure official Kalshi client with proper host URL
+        config = Configuration()
+        config.host = base_url
+        config.api_key_id = api_key
+        config.private_key_pem = private_key
 
-        try:
-            return serialization.load_pem_private_key(
-                key_data,
-                password=None,
-                backend=default_backend()
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to load private key: {e}")
-            self.logger.error(f"Key starts with: {private_key_str[:50]}...")
-            raise
-
-    def _sign_request(self, timestamp: str, method: str, path: str) -> str:
-        """Sign the request using RSA-PSS with SHA256."""
-        # Strip query parameters from path for signing
-        path_without_query = path.split('?')[0]
-
-        # Message to sign: timestamp + method + path (just the endpoint, no API prefix)
-        # The path should be like "/portfolio/positions" not "/trade-api/v2/portfolio/positions"
-        message = f"{timestamp}{method}{path_without_query}"
-        self.logger.info(f"Signing: {message}")
-        message_bytes = message.encode('utf-8')
-
-        signature = self.private_key.sign(
-            message_bytes,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.DIGEST_LENGTH  # Use DIGEST_LENGTH per Kalshi docs
-            ),
-            hashes.SHA256()
-        )
-
-        return base64.b64encode(signature).decode('utf-8')
-
-    def get_headers(self, method: str, path: str) -> Dict[str, str]:
-        """Generate headers with RSA signature for authentication."""
-        # Timestamp in milliseconds
-        timestamp = str(int(time.time() * 1000))
-
-        # Sign the request (path without query params)
-        signature = self._sign_request(timestamp, method, path)
-
-        return {
-            "KALSHI-ACCESS-KEY": self.api_key,
-            "KALSHI-ACCESS-SIGNATURE": signature,
-            "KALSHI-ACCESS-TIMESTAMP": timestamp,
-            "Content-Type": "application/json",
-        }
-
-    def make_request(
-        self, method: str, path: str, params: Dict = None, data: Dict = None
-    ):
-        url = f"{self.base_url}{path}"
-        headers = self.get_headers(method, path)
-
-        try:
-            response = requests.request(
-                method, url, headers=headers, params=params, json=data
-            )
-            self.logger.debug(f"Request URL: {response.url}")
-            self.logger.debug(f"Request method: {method}")
-            self.logger.debug(f"Request path: {path}")
-            self.logger.debug(f"Request params: {params}")
-            self.logger.debug(f"Request data: {data}")
-            self.logger.debug(f"Response status code: {response.status_code}")
-            self.logger.debug(f"Response content: {response.text}")
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Request failed: {e}")
-            if hasattr(e, "response") and e.response is not None:
-                self.logger.error(f"Response content: {e.response.text}")
-            raise
+        # Initialize official Kalshi client
+        self.client = KalshiClient(configuration=config)
+        self.logger.info(f"API key authentication initialized via official Kalshi client (host: {base_url})")
 
     def logout(self):
         """No logout needed for API key auth - included for compatibility."""
@@ -162,99 +65,136 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
     def get_position(self) -> int:
         self.logger.info("Retrieving position...")
-        path = "/portfolio/positions"
-        params = {"ticker": self.market_ticker, "settlement_status": "unsettled"}
-        response = self.make_request("GET", path, params=params)
-        positions = response.get("market_positions", [])
+        try:
+            response = self.client.get_positions(
+                ticker=self.market_ticker,
+                settlement_status="unsettled"
+            )
+            positions = response.market_positions or []
 
-        total_position = 0
-        for position in positions:
-            if position["ticker"] == self.market_ticker:
-                total_position += position["position"]
+            total_position = 0
+            for position in positions:
+                if position.ticker == self.market_ticker:
+                    total_position += position.position
 
-        self.logger.info(f"Current position: {total_position}")
-        return total_position
+            self.logger.info(f"Current position: {total_position}")
+            return total_position
+        except Exception as e:
+            self.logger.error(f"Failed to get position: {e}")
+            raise
 
     def get_price(self) -> Dict[str, float]:
         self.logger.info("Retrieving market data...")
-        path = f"/markets/{self.market_ticker}"
-        data = self.make_request("GET", path)
+        try:
+            response = self.client.get_market(self.market_ticker)
+            market = response.market
 
-        yes_bid = float(data["market"]["yes_bid"]) / 100
-        yes_ask = float(data["market"]["yes_ask"]) / 100
-        no_bid = float(data["market"]["no_bid"]) / 100
-        no_ask = float(data["market"]["no_ask"]) / 100
+            yes_bid = float(market.yes_bid) / 100
+            yes_ask = float(market.yes_ask) / 100
+            no_bid = float(market.no_bid) / 100
+            no_ask = float(market.no_ask) / 100
 
-        yes_mid_price = round((yes_bid + yes_ask) / 2, 2)
-        no_mid_price = round((no_bid + no_ask) / 2, 2)
+            yes_mid_price = round((yes_bid + yes_ask) / 2, 2)
+            no_mid_price = round((no_bid + no_ask) / 2, 2)
 
-        self.logger.info(f"Current yes mid-market price: ${yes_mid_price:.2f}")
-        self.logger.info(f"Current no mid-market price: ${no_mid_price:.2f}")
-        return {"yes": yes_mid_price, "no": no_mid_price}
+            self.logger.info(f"Current yes mid-market price: ${yes_mid_price:.2f}")
+            self.logger.info(f"Current no mid-market price: ${no_mid_price:.2f}")
+            return {"yes": yes_mid_price, "no": no_mid_price}
+        except Exception as e:
+            self.logger.error(f"Failed to get price: {e}")
+            raise
 
     def place_order(self, action: str, side: str, price: float, quantity: int, expiration_ts: int = None) -> str:
         self.logger.info(f"Placing {action} order for {side} side at price ${price:.2f} with quantity {quantity}...")
-        path = "/portfolio/orders"
-        data = {
-            "ticker": self.market_ticker,
-            "action": action.lower(),  # 'buy' or 'sell'
-            "type": "limit",
-            "side": side,  # 'yes' or 'no'
-            "count": quantity,
-            "client_order_id": str(uuid.uuid4()),
-        }
-        price_to_send = int(price * 100)  # Convert dollars to cents
-
-        if side == "yes":
-            data["yes_price"] = price_to_send
-        else:
-            data["no_price"] = price_to_send
-
-        if expiration_ts is not None:
-            data["expiration_ts"] = expiration_ts
-
         try:
-            response = self.make_request("POST", path, data=data)
-            order_id = response["order"]["order_id"]
-            self.logger.info(f"Placed {action} order for {side} side at price ${price:.2f} with quantity {quantity}, order ID: {order_id}")
+            price_cents = int(price * 100)
+
+            # Build order params
+            order_params = {
+                "ticker": self.market_ticker,
+                "action": action.lower(),
+                "type": "limit",
+                "side": side,
+                "count": quantity,
+                "client_order_id": str(uuid.uuid4()),
+            }
+
+            if side == "yes":
+                order_params["yes_price"] = price_cents
+            else:
+                order_params["no_price"] = price_cents
+
+            if expiration_ts is not None:
+                order_params["expiration_ts"] = expiration_ts
+
+            response = self.client.create_order(**order_params)
+            order_id = response.order.order_id
+            self.logger.info(f"Placed {action} order, order ID: {order_id}")
             return str(order_id)
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             self.logger.error(f"Failed to place order: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                self.logger.error(f"Response content: {e.response.text}")
-                self.logger.error(f"Request data: {data}")
             raise
 
     def cancel_order(self, order_id: int) -> bool:
         self.logger.info(f"Canceling order with ID {order_id}...")
-        path = f"/portfolio/orders/{order_id}"
-        response = self.make_request("DELETE", path)
-        success = response["reduced_by"] > 0
-        self.logger.info(f"Canceled order with ID {order_id}, success: {success}")
-        return success
+        try:
+            response = self.client.cancel_order(order_id=str(order_id))
+            success = response.reduced_by > 0
+            self.logger.info(f"Canceled order with ID {order_id}, success: {success}")
+            return success
+        except Exception as e:
+            self.logger.error(f"Failed to cancel order: {e}")
+            raise
 
     def get_orders(self) -> List[Dict]:
         self.logger.info("Retrieving orders...")
-        path = "/portfolio/orders"
-        params = {"ticker": self.market_ticker, "status": "resting"}
-        response = self.make_request("GET", path, params=params)
-        orders = response.get("orders", [])
-        self.logger.info(f"Retrieved {len(orders)} orders")
-        return orders
+        try:
+            response = self.client.get_orders(
+                ticker=self.market_ticker,
+                status="resting"
+            )
+            orders = response.orders or []
+            # Convert to dict format for compatibility
+            orders_list = []
+            for order in orders:
+                orders_list.append({
+                    'order_id': order.order_id,
+                    'ticker': order.ticker,
+                    'action': order.action,
+                    'side': order.side,
+                    'yes_price': order.yes_price,
+                    'no_price': order.no_price,
+                    'remaining_count': order.remaining_count,
+                })
+            self.logger.info(f"Retrieved {len(orders_list)} orders")
+            return orders_list
+        except Exception as e:
+            self.logger.error(f"Failed to get orders: {e}")
+            raise
 
     def get_active_markets_by_series(self, series_ticker: str) -> List[Dict]:
         """Fetch all active/open markets for a given series ticker."""
         self.logger.info(f"Fetching active markets for series: {series_ticker}")
-        path = "/markets"
-        params = {
-            "series_ticker": series_ticker,
-            "status": "open",
-            "limit": 100
-        }
-        response = self.make_request("GET", path, params=params)
-        markets = response.get("markets", [])
-        self.logger.info(f"Found {len(markets)} active markets for series {series_ticker}")
-        return markets
+        try:
+            response = self.client.get_markets(
+                series_ticker=series_ticker,
+                status="open",
+                limit=100
+            )
+            markets = response.markets or []
+            # Convert to dict format
+            markets_list = []
+            for market in markets:
+                markets_list.append({
+                    'ticker': market.ticker,
+                    'title': getattr(market, 'title', ''),
+                    'status': market.status,
+                })
+            self.logger.info(f"Found {len(markets_list)} active markets for series {series_ticker}")
+            return markets_list
+        except Exception as e:
+            self.logger.error(f"Failed to get markets: {e}")
+            raise
 
     def cancel_all_orders_for_market(self) -> int:
         """Cancel all resting orders for the current market."""
@@ -304,19 +244,22 @@ class AvellanedaMarketMaker:
             current_time = time.time() - start_time
             self.logger.info(f"Running Avellaneda market maker at {current_time:.2f}")
 
-            mid_prices = self.api.get_price()
-            mid_price = mid_prices[self.trade_side]
-            inventory = self.api.get_position()
-            self.logger.info(f"Current mid price for {self.trade_side}: {mid_price:.4f}, Inventory: {inventory}")
+            try:
+                mid_prices = self.api.get_price()
+                mid_price = mid_prices[self.trade_side]
+                inventory = self.api.get_position()
+                self.logger.info(f"Current mid price for {self.trade_side}: {mid_price:.4f}, Inventory: {inventory}")
 
-            reservation_price = self.calculate_reservation_price(mid_price, inventory, current_time)
-            bid_price, ask_price = self.calculate_asymmetric_quotes(mid_price, inventory, current_time)
-            buy_size, sell_size = self.calculate_order_sizes(inventory)
+                reservation_price = self.calculate_reservation_price(mid_price, inventory, current_time)
+                bid_price, ask_price = self.calculate_asymmetric_quotes(mid_price, inventory, current_time)
+                buy_size, sell_size = self.calculate_order_sizes(inventory)
 
-            self.logger.info(f"Reservation price: {reservation_price:.4f}")
-            self.logger.info(f"Computed desired bid: {bid_price:.4f}, ask: {ask_price:.4f}")
+                self.logger.info(f"Reservation price: {reservation_price:.4f}")
+                self.logger.info(f"Computed desired bid: {bid_price:.4f}, ask: {ask_price:.4f}")
 
-            self.manage_orders(bid_price, ask_price, buy_size, sell_size)
+                self.manage_orders(bid_price, ask_price, buy_size, sell_size)
+            except Exception as e:
+                self.logger.error(f"Error in market maker loop: {e}")
 
             time.sleep(dt)
 
