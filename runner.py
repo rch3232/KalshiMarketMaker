@@ -16,6 +16,9 @@ import re
 PARLAY_KEYWORDS = re.compile(r'\b(parlay|combo|multi-leg|accumulator)\b', re.IGNORECASE)
 # Pattern to detect "X and Y" connecting different outcomes (e.g., "Team A wins and Team B wins")
 MULTI_OUTCOME_PATTERN = re.compile(r'\b\w+\s+(?:wins?|scores?|over|under)\s+and\s+\w+\s+(?:wins?|scores?|over|under)\b', re.IGNORECASE)
+# Pattern to detect player prop parlays: "yes X: N+,yes Y: M+" format
+# Matches patterns like "yes Stephon Castle: 4+,yes De'Aaron Fox: 10+"
+PLAYER_PROP_PARLAY_PATTERN = re.compile(r'yes\s+[^,]+:\s*\d+\+?\s*,\s*yes\s+', re.IGNORECASE)
 
 
 def is_parlay_or_combo_market(market: Dict) -> tuple[bool, str]:
@@ -53,7 +56,11 @@ def is_parlay_or_combo_market(market: Dict) -> tuple[bool, str]:
     if MULTI_OUTCOME_PATTERN.search(combined_text):
         return True, f"multi-outcome pattern in title/subtitle: {combined_text[:50]}"
 
-    # Check 6: Multiple " and " conjunctions suggesting combined bets
+    # Check 6: Player prop parlay pattern (e.g., "yes Stephon Castle: 4+,yes De'Aaron Fox: 10+")
+    if PLAYER_PROP_PARLAY_PATTERN.search(combined_text):
+        return True, f"player prop parlay pattern in title/subtitle: {combined_text[:80]}"
+
+    # Check 7: Multiple " and " conjunctions suggesting combined bets
     # Count occurrences of " and " that might indicate multiple legs
     and_count = combined_text.lower().count(' and ')
     if and_count >= 2:
