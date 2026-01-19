@@ -141,15 +141,22 @@ def run_dynamic_strategies(config: Dict):
     4. Refreshes market list periodically
     """
     api_key = os.getenv("KALSHI_API_KEY")
-    private_key = os.getenv("KALSHI_PRIVATE_KEY")
+    private_key_env = os.getenv("KALSHI_PRIVATE_KEY")
     base_url = os.getenv("KALSHI_BASE_URL")
 
-    if not all([api_key, private_key, base_url]):
+    if not all([api_key, private_key_env, base_url]):
         runner_logger.error("Missing required environment variables: KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_BASE_URL")
         return
 
-    # Handle newlines in private key (environment variables often escape them)
-    private_key = private_key.replace('\\n', '\n')
+    # Check if private_key_env is a file path or the actual key
+    if private_key_env.startswith('/') and os.path.isfile(private_key_env):
+        runner_logger.info(f"Reading private key from file: {private_key_env}")
+        with open(private_key_env, 'r') as f:
+            private_key = f.read()
+    else:
+        private_key = private_key_env
+        # Handle newlines in private key (environment variables often escape them)
+        private_key = private_key.replace('\\n', '\n')
 
     # Extract configuration
     series_list = config.get('series', [])
@@ -229,10 +236,17 @@ def run_static_strategy(config_name: str, config: Dict):
 
     logger.info(f"Starting strategy: {config_name}")
 
-    # Handle newlines in private key
-    private_key = os.getenv("KALSHI_PRIVATE_KEY")
-    if private_key:
-        private_key = private_key.replace('\\n', '\n')
+    # Handle private key - check if it's a file path or the actual key
+    private_key_env = os.getenv("KALSHI_PRIVATE_KEY")
+    if private_key_env:
+        if private_key_env.startswith('/') and os.path.isfile(private_key_env):
+            logger.info(f"Reading private key from file: {private_key_env}")
+            with open(private_key_env, 'r') as f:
+                private_key = f.read()
+        else:
+            private_key = private_key_env.replace('\\n', '\n')
+    else:
+        private_key = None
 
     api = KalshiTradingAPI(
         api_key=os.getenv("KALSHI_API_KEY"),
