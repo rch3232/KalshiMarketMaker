@@ -108,13 +108,13 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
     def _make_request(self, method: str, endpoint: str, data: dict = None) -> dict:
         """Make an authenticated request to the Kalshi API."""
-        # Build full URL (base already includes /trade-api/v2)
+        # Build full URL
         base_url = "https://api.elections.kalshi.com/trade-api/v2"
         url = f"{base_url}{endpoint}"
 
-        # For signing: use just the endpoint path, stripped of query params
-        # Per Kalshi example: sign "/markets" not "/trade-api/v2/markets"
-        path_for_signing = endpoint.split('?')[0]
+        # For signing: MUST include /trade-api/v2, strip query params
+        # Per Kalshi docs: URL /trade-api/v2/markets?limit=100 signs as /trade-api/v2/markets
+        path_for_signing = f"/trade-api/v2{endpoint.split('?')[0]}"
 
         # Generate timestamp in milliseconds (must be 13 digits)
         timestamp_ms = int(time.time() * 1000)
