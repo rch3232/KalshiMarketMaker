@@ -6,8 +6,7 @@ import uuid
 import math
 
 # Use official Kalshi Python client for authentication
-from kalshi_python import Configuration
-from kalshi_python.client import KalshiClient
+from kalshi_python import Configuration, KalshiClient
 
 
 class AbstractTradingAPI(abc.ABC):
