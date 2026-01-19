@@ -28,26 +28,32 @@ def is_parlay_or_combo_market(market: Dict) -> tuple[bool, str]:
     title = market.get('title', '')
     subtitle = market.get('subtitle', '')
 
-    # Check 1: is_combo metadata flag
-    if market.get('is_combo', False):
+    # Check 1: is_combo metadata flag - only skip if explicitly True
+    if market.get('is_combo') is True:
         return True, "is_combo=True"
 
-    # Check 2: Ticker format - contains comma or exceeds 20 characters
-    if ',' in ticker:
-        return True, f"ticker contains comma: {ticker}"
-    if len(ticker) > 20:
-        return True, f"ticker exceeds 20 chars: {ticker}"
+    # Check 2: Ticker format - more than one comma indicates parlay, or exceeds 60 characters
+    comma_count = ticker.count(',')
+    if comma_count > 1:
+        return True, f"ticker contains {comma_count} commas (parlay indicator): {ticker}"
+    if len(ticker) > 60:
+        return True, f"ticker exceeds 60 chars: {ticker}"
 
-    # Check 3: Title/subtitle contains parlay keywords
+    # Check 3: market_type must be 'binary'
+    market_type = market.get('market_type', '')
+    if market_type != 'binary':
+        return True, f"market_type is '{market_type}', not 'binary'"
+
+    # Check 4: Title/subtitle contains parlay keywords
     combined_text = f"{title} {subtitle}"
     if PARLAY_KEYWORDS.search(combined_text):
         return True, f"parlay keyword in title/subtitle: {combined_text[:50]}"
 
-    # Check 4: Title/subtitle contains multi-outcome pattern (e.g., "X wins and Y wins")
+    # Check 5: Title/subtitle contains multi-outcome pattern (e.g., "X wins and Y wins")
     if MULTI_OUTCOME_PATTERN.search(combined_text):
         return True, f"multi-outcome pattern in title/subtitle: {combined_text[:50]}"
 
-    # Check 5: Multiple " and " conjunctions suggesting combined bets
+    # Check 6: Multiple " and " conjunctions suggesting combined bets
     # Count occurrences of " and " that might indicate multiple legs
     and_count = combined_text.lower().count(' and ')
     if and_count >= 2:
@@ -223,6 +229,7 @@ def fetch_active_markets(series_list: List[str], api_key: str, private_key: str,
                         continue
 
                     active_tickers.append(ticker)
+                    print(f'Valid Market Found: {ticker}')
                     logger.info(f"Found active market: {ticker}")
             except Exception as e:
                 logger.error(f"Failed to fetch markets for series {series}: {e}")
@@ -279,6 +286,7 @@ def fetch_active_markets_by_category(category: str, api_key: str, private_key: s
                 continue
 
             active_tickers.append(ticker)
+            print(f'Valid Market Found: {ticker}')
             # Log with additional context about the market
             title = market.get('title', 'Unknown')
             subtitle = market.get('subtitle', '')
