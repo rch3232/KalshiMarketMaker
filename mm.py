@@ -334,11 +334,20 @@ class KalshiTradingAPI(AbstractTradingAPI):
                             result["yes_cost"] = round(avg_price / 100, 2)
 
                     # Check for NO position cost (position < 0 means long NO)
+                    # First try explicit no_position field, then derive from negative position
                     no_qty = pos.get("no_position", 0)
+                    position_val = pos.get("position", 0)
+                    if not no_qty and position_val < 0:
+                        # Negative position means long NO
+                        no_qty = abs(position_val)
                     if no_qty and no_qty > 0:
                         exposure_cents = pos.get("market_exposure", 0)
                         if exposure_cents and no_qty > 0:
                             result["no_cost"] = round(exposure_cents / 100 / no_qty, 2)
+                        # Fallback: check for average_buy_price (used for the current position side)
+                        avg_price = pos.get("average_buy_price")
+                        if avg_price and position_val < 0:
+                            result["no_cost"] = round(avg_price / 100, 2)
 
             self.logger.info(f"Position: {result['position']}, YES cost: ${result['yes_cost']:.2f}, "
                            f"NO cost: ${result['no_cost']:.2f}")
@@ -1028,6 +1037,34 @@ class AvellanedaMarketMaker:
                 self.logger.info("In exit mode - waiting for exit order to fill")
                 self.t += dt
                 return
+
+            # CRITICAL FIX: When we have a position, constrain opposite-side bid
+            # to ensure flattening trades are profitable, not loss-making.
+            # If we own NO at cost $X, buying YES at price > (1.00 - X) loses money.
+            # If we own YES at cost $X, buying NO at price > (1.00 - X) loses money.
+            min_profit_margin = 0.01  # Require at least 1 cent profit on flattening
+
+            if self.pending_exit is not None and q != 0:
+                try:
+                    position_info = self.api.get_position_with_cost()
+                    if q > 0:  # Long YES, constraining NO bid
+                        yes_cost = position_info.get('yes_cost', 0)
+                        if yes_cost > 0:
+                            max_no_bid = round(1.00 - yes_cost - min_profit_margin, 2)
+                            if no_bid > max_no_bid:
+                                self.logger.info(f"COST BASIS CONSTRAINT: NO bid ${no_bid:.2f} exceeds "
+                                               f"max ${max_no_bid:.2f} (YES cost=${yes_cost:.2f}), capping")
+                                no_bid = max(0.02, max_no_bid)
+                    elif q < 0:  # Long NO, constraining YES bid
+                        no_cost = position_info.get('no_cost', 0)
+                        if no_cost > 0:
+                            max_yes_bid = round(1.00 - no_cost - min_profit_margin, 2)
+                            if yes_bid > max_yes_bid:
+                                self.logger.info(f"COST BASIS CONSTRAINT: YES bid ${yes_bid:.2f} exceeds "
+                                               f"max ${max_yes_bid:.2f} (NO cost=${no_cost:.2f}), capping")
+                                yes_bid = max(0.02, max_yes_bid)
+                except Exception as e:
+                    self.logger.warning(f"Could not get cost basis for constraint check: {e}")
 
             # Normal market making mode
             # Cancel all existing orders first (order management requirement)
