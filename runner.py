@@ -542,11 +542,22 @@ def fetch_active_markets_by_category(
                 continue
 
             # Check liquidity requirements
-            is_liquid, liq_reason = check_market_liquidity(market, min_volume, max_spread_cents)
-            if not is_liquid:
-                logger.debug(f"Skipping illiquid market: {ticker} - {liq_reason}")
-                skipped_liquidity += 1
-                continue
+            # - Regular markets: full check (order book, spread, volume)
+            # - Incentive markets: only check volume (bypass spread/order book checks)
+            if has_incentive:
+                # Incentive markets only need to meet volume requirement
+                if min_volume > 0:
+                    volume = market.get('volume', 0) or market.get('volume_24h', 0) or 0
+                    if volume < min_volume:
+                        logger.debug(f"Skipping incentive market with low volume: {ticker} - volume {volume} < {min_volume}")
+                        skipped_liquidity += 1
+                        continue
+            else:
+                is_liquid, liq_reason = check_market_liquidity(market, min_volume, max_spread_cents)
+                if not is_liquid:
+                    logger.debug(f"Skipping illiquid market: {ticker} - {liq_reason}")
+                    skipped_liquidity += 1
+                    continue
 
             # Apply long shot bias filter ONLY if:
             # 1. Filter is enabled

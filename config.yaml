@@ -58,8 +58,8 @@ max_concurrent_markets: 30
 
 liquidity_filter:
   # Minimum 24h volume required (0 = disabled)
-  # Set to 0 to allow new markets that don't have volume yet
-  min_volume: 0
+  # This filter applies to all markets (including incentive markets)
+  min_volume: 3500
 
   # Maximum bid-ask spread in cents
   # Markets with spreads wider than this are skipped (likely illiquid)
@@ -88,14 +88,17 @@ longshot_filter:
 # LIQUIDITY INCENTIVES
 # =============================================================================
 # Kalshi's Liquidity Incentive Program pays for resting orders within 2¢ of strike
-# Markets with incentives are prioritized and bypass the long shot filter
+# Markets with incentives are prioritized and have relaxed filtering rules
 
 liquidity_incentives:
   # Enable fetching and prioritizing incentive markets
   enabled: true
 
   # Incentive markets are checked every 5 minutes (synced with refresh_interval)
-  # They get priority in the market queue and bypass longshot_filter
+  # They get priority in the market queue with special filter handling:
+  # - Volume check: APPLIED (must still meet min_volume requirement)
+  # - Spread/order book check: BYPASSED (trade even with wide spreads)
+  # - Long shot filter: BYPASSED (trade at any price level)
 
 # =============================================================================
 # MARKET MAKER PARAMETERS
