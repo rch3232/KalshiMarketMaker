@@ -10,61 +10,36 @@ from typing import Dict, List, Set
 
 from mm import KalshiTradingAPI, AvellanedaMarketMaker
 
-import re
-
-# Patterns to detect parlay/combo markets in title/subtitle
-PARLAY_KEYWORDS = re.compile(r'\b(parlay|combo|multi-leg|accumulator)\b', re.IGNORECASE)
-# Pattern to detect "X and Y" connecting different outcomes (e.g., "Team A wins and Team B wins")
-MULTI_OUTCOME_PATTERN = re.compile(r'\b\w+\s+(?:wins?|scores?|over|under)\s+and\s+\w+\s+(?:wins?|scores?|over|under)\b', re.IGNORECASE)
-# Pattern to detect multi-leg parlays with comma-separated yes/no conditions
-# Matches: "yes X: 10+,no Y wins by...", "yes X: 25+,yes Y: 30+", etc.
-MULTI_LEG_PARLAY_PATTERN = re.compile(r'(?:yes|no)\s+[^,]+,\s*(?:yes|no)\s+', re.IGNORECASE)
-
 
 def is_parlay_or_combo_market(market: Dict) -> tuple[bool, str]:
     """Check if a market is a parlay/combo that should be skipped.
+
+    Note: The API call uses mve_filter=exclude to filter out most multivariate markets
+    at the source. This function provides additional client-side validation.
 
     Returns:
         tuple of (should_skip: bool, reason: str)
     """
     ticker = market.get('ticker', '')
-    title = market.get('title', '')
-    subtitle = market.get('subtitle', '')
 
-    # Check 1: is_combo metadata flag - only skip if explicitly True
+    # Check 1: is_multivariate metadata flag - most reliable way to spot combos
+    if market.get('is_multivariate') is True:
+        return True, "is_multivariate=True"
+
+    # Check 2: is_combo metadata flag - backup check
     if market.get('is_combo') is True:
         return True, "is_combo=True"
 
-    # Check 2: Ticker format - more than one comma indicates parlay, or exceeds 60 characters
+    # Check 3: Ticker format - more than one comma indicates parlay
+    # Single markets may have one comma for specific outcomes, parlays use many
     comma_count = ticker.count(',')
     if comma_count > 1:
-        return True, f"ticker contains {comma_count} commas (parlay indicator): {ticker}"
-    if len(ticker) > 60:
-        return True, f"ticker exceeds 60 chars: {ticker}"
+        return True, f"ticker contains {comma_count} commas (parlay indicator)"
 
-    # Check 3: market_type must be 'binary'
+    # Check 4: market_type must be 'binary'
     market_type = market.get('market_type', '')
     if market_type != 'binary':
         return True, f"market_type is '{market_type}', not 'binary'"
-
-    # Check 4: Title/subtitle contains parlay keywords
-    combined_text = f"{title} {subtitle}"
-    if PARLAY_KEYWORDS.search(combined_text):
-        return True, f"parlay keyword in title/subtitle: {combined_text[:50]}"
-
-    # Check 5: Title/subtitle contains multi-outcome pattern (e.g., "X wins and Y wins")
-    if MULTI_OUTCOME_PATTERN.search(combined_text):
-        return True, f"multi-outcome pattern in title/subtitle: {combined_text[:50]}"
-
-    # Check 6: Multi-leg parlay pattern (e.g., "yes X: 10+,no Y wins by...", "yes X: 25+,yes Y: 30+")
-    if MULTI_LEG_PARLAY_PATTERN.search(combined_text):
-        return True, f"multi-leg parlay pattern in title/subtitle: {combined_text[:80]}"
-
-    # Check 7: Multiple " and " conjunctions suggesting combined bets
-    # Count occurrences of " and " that might indicate multiple legs
-    and_count = combined_text.lower().count(' and ')
-    if and_count >= 2:
-        return True, f"multiple 'and' conjunctions ({and_count}): {combined_text[:50]}"
 
     return False, ""
 
@@ -287,8 +262,8 @@ def fetch_active_markets(series_list: List[str], api_key: str, private_key: str,
                         continue
 
                     active_tickers.append(ticker)
-                    print(f'Valid Market Found: {ticker}')
-                    logger.info(f"Found active market: {ticker}")
+                    print(f'Discovered Market: {ticker}')
+                    logger.info(f"Discovered market: {ticker}")
             except Exception as e:
                 logger.error(f"Failed to fetch markets for series {series}: {e}")
 
@@ -335,6 +310,7 @@ def fetch_active_markets_by_category(category: str, api_key: str, private_key: s
         markets = temp_api.get_active_markets_by_category(category)
         skipped_parlay = 0
         skipped_liquidity = 0
+        parlay_reasons = {}  # Track breakdown of parlay filter reasons
         for market in markets:
             ticker = market.get('ticker')
             if not ticker:
@@ -343,26 +319,32 @@ def fetch_active_markets_by_category(category: str, api_key: str, private_key: s
             # Filter out parlay/combo markets
             is_parlay, reason = is_parlay_or_combo_market(market)
             if is_parlay:
-                logger.info(f"Skipping parlay/combo market: {ticker} - {reason}")
+                logger.debug(f"Skipping parlay/combo market: {ticker} - {reason}")
                 skipped_parlay += 1
+                # Track reason breakdown for diagnostics
+                reason_key = reason.split(':')[0] if ':' in reason else reason
+                parlay_reasons[reason_key] = parlay_reasons.get(reason_key, 0) + 1
                 continue
 
             # Check liquidity requirements
             is_liquid, liq_reason = check_market_liquidity(market, min_volume, max_spread_cents)
             if not is_liquid:
-                logger.info(f"Skipping illiquid market: {ticker} - {liq_reason}")
+                logger.debug(f"Skipping illiquid market: {ticker} - {liq_reason}")
                 skipped_liquidity += 1
                 continue
 
             active_tickers.append(ticker)
-            print(f'Valid Market Found: {ticker}')
+            print(f'Discovered Market: {ticker}')
             # Log with additional context about the market
             title = market.get('title', 'Unknown')
             subtitle = market.get('subtitle', '')
-            logger.info(f"Found active market: {ticker} - {title} {subtitle}".strip())
+            logger.info(f"Discovered market: {ticker} - {title} {subtitle}".strip())
 
         temp_api.logout()
         logger.info(f"Total markets found in category '{category}': {len(active_tickers)} (skipped {skipped_parlay} parlays, {skipped_liquidity} illiquid)")
+        # Log breakdown of parlay filter reasons for debugging
+        if parlay_reasons:
+            logger.info(f"Parlay filter breakdown: {parlay_reasons}")
 
     except Exception as e:
         logger.error(f"Failed to fetch markets for category {category}: {e}")

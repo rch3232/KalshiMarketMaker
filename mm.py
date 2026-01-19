@@ -418,6 +418,9 @@ class KalshiTradingAPI(AbstractTradingAPI):
         This method fetches sports markets without needing to know specific series
         tickers in advance. It handles pagination with a configurable limit.
 
+        Uses mve_filter=exclude to filter out multivariate (combo/parlay) markets
+        at the API level, which is more efficient than filtering after fetch.
+
         Args:
             category: The market category to fetch (default: "Sports")
             max_markets: Maximum number of markets to fetch to prevent unbounded memory
@@ -433,7 +436,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
         try:
             while True:
                 # Build endpoint with pagination support
-                endpoint = f"/markets?category={category}&status=open&limit=200"
+                # mve_filter=exclude tells Kalshi to exclude multivariate (parlay/combo) markets
+                endpoint = f"/markets?category={category}&status=open&limit=200&mve_filter=exclude"
                 if cursor:
                     endpoint += f"&cursor={cursor}"
 
