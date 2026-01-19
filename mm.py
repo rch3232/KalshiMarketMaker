@@ -1303,7 +1303,8 @@ class AvellanedaMarketMaker:
         seconds_until_close = self.close_time - time.time()
         return seconds_until_close <= self.near_close_seconds and seconds_until_close > 0
 
-    def apply_profitability_constraint(self, yes_bid: float, no_bid: float, position: int) -> Tuple[float, float]:
+    def apply_profitability_constraint(self, yes_bid: float, no_bid: float, position: int,
+                                        market_yes_bid: float = 0, market_no_bid: float = 0) -> Tuple[float, float, bool]:
         """Apply profitability constraint to prevent guaranteed-loss pair trades.
 
         Normal mode (not near close):
@@ -1318,13 +1319,18 @@ class AvellanedaMarketMaker:
             yes_bid: Desired YES bid price
             no_bid: Desired NO bid price
             position: Current position (positive = long YES, negative = long NO)
+            market_yes_bid: Current market YES bid (to check if constrained bid is uncompetitive)
+            market_no_bid: Current market NO bid (to check if constrained bid is uncompetitive)
 
         Returns:
-            Tuple of (constrained_yes_bid, constrained_no_bid)
+            Tuple of (constrained_yes_bid, constrained_no_bid, should_also_sell)
+            should_also_sell is True if constrained bid is too far below market to fill
         """
+        should_also_sell = False
+
         if position == 0:
             # No position, no constraint needed
-            return yes_bid, no_bid
+            return yes_bid, no_bid, False
 
         near_close = self.is_near_close()
         allowed_loss = self.max_loss_near_close if near_close else 0.0
@@ -1336,27 +1342,42 @@ class AvellanedaMarketMaker:
             if self.yes_cost_basis > 0:
                 max_no_bid = 1.00 - self.yes_cost_basis + allowed_loss
                 if no_bid > max_no_bid:
-                    if near_close:
-                        self.logger.info(f"NEAR CLOSE: Allowing NO bid ${no_bid:.2f} -> ${max_no_bid:.2f} "
+                    original_no_bid = no_bid
+                    no_bid = max(0.01, max_no_bid)  # Don't go below 1 cent
+
+                    # Check if constrained bid is uncompetitive (>5¢ below market)
+                    # If so, signal that we should also try to sell the YES position
+                    if market_no_bid > 0 and (market_no_bid - no_bid) > 0.05:
+                        should_also_sell = True
+                        self.logger.info(f"PROFIT CONSTRAINT: NO bid ${original_no_bid:.2f} -> ${no_bid:.2f} "
+                                       f"(YES cost=${self.yes_cost_basis:.2f}) - UNCOMPETITIVE vs market ${market_no_bid:.2f}, will also try to sell YES")
+                    elif near_close:
+                        self.logger.info(f"NEAR CLOSE: Allowing NO bid ${original_no_bid:.2f} -> ${no_bid:.2f} "
                                        f"(YES cost=${self.yes_cost_basis:.2f}, max loss=${allowed_loss:.2f})")
                     else:
-                        self.logger.info(f"PROFIT CONSTRAINT: Capping NO bid ${no_bid:.2f} -> ${max_no_bid:.2f} "
-                                       f"(YES cost=${self.yes_cost_basis:.2f}, would lose ${no_bid + self.yes_cost_basis - 1.0:.2f})")
-                    no_bid = max(0.01, max_no_bid)  # Don't go below 1 cent
+                        self.logger.info(f"PROFIT CONSTRAINT: Capping NO bid ${original_no_bid:.2f} -> ${no_bid:.2f} "
+                                       f"(YES cost=${self.yes_cost_basis:.2f}, would lose ${original_no_bid + self.yes_cost_basis - 1.0:.2f})")
         else:
             # Long NO - constrain YES bid to ensure profitability
             if self.no_cost_basis > 0:
                 max_yes_bid = 1.00 - self.no_cost_basis + allowed_loss
                 if yes_bid > max_yes_bid:
-                    if near_close:
-                        self.logger.info(f"NEAR CLOSE: Allowing YES bid ${yes_bid:.2f} -> ${max_yes_bid:.2f} "
-                                       f"(NO cost=${self.no_cost_basis:.2f}, max loss=${allowed_loss:.2f})")
-                    else:
-                        self.logger.info(f"PROFIT CONSTRAINT: Capping YES bid ${yes_bid:.2f} -> ${max_yes_bid:.2f} "
-                                       f"(NO cost=${self.no_cost_basis:.2f}, would lose ${yes_bid + self.no_cost_basis - 1.0:.2f})")
+                    original_yes_bid = yes_bid
                     yes_bid = max(0.01, max_yes_bid)  # Don't go below 1 cent
 
-        return yes_bid, no_bid
+                    # Check if constrained bid is uncompetitive (>5¢ below market)
+                    if market_yes_bid > 0 and (market_yes_bid - yes_bid) > 0.05:
+                        should_also_sell = True
+                        self.logger.info(f"PROFIT CONSTRAINT: YES bid ${original_yes_bid:.2f} -> ${yes_bid:.2f} "
+                                       f"(NO cost=${self.no_cost_basis:.2f}) - UNCOMPETITIVE vs market ${market_yes_bid:.2f}, will also try to sell NO")
+                    elif near_close:
+                        self.logger.info(f"NEAR CLOSE: Allowing YES bid ${original_yes_bid:.2f} -> ${yes_bid:.2f} "
+                                       f"(NO cost=${self.no_cost_basis:.2f}, max loss=${allowed_loss:.2f})")
+                    else:
+                        self.logger.info(f"PROFIT CONSTRAINT: Capping YES bid ${original_yes_bid:.2f} -> ${yes_bid:.2f} "
+                                       f"(NO cost=${self.no_cost_basis:.2f}, would lose ${original_yes_bid + self.no_cost_basis - 1.0:.2f})")
+
+        return yes_bid, no_bid, should_also_sell
 
     def update_cost_basis(self, side: str, fill_price: float, fill_quantity: int) -> None:
         """Update cost basis when a fill occurs.
@@ -2115,8 +2136,28 @@ class AvellanedaMarketMaker:
             # Apply profitability constraint to prevent guaranteed-loss pair trades
             # Normal mode: Caps opposite-side bids so cost basis + bid <= $1.00 (break even)
             # Near close mode: Allows small losses up to max_loss_near_close to exit positions
+            # If constrained bid is uncompetitive, also try to sell the owned position
+            constraint_triggered_sell = False
             if q != 0 and (self.yes_cost_basis > 0 or self.no_cost_basis > 0):
-                yes_bid, no_bid = self.apply_profitability_constraint(yes_bid, no_bid, q)
+                yes_bid, no_bid, constraint_triggered_sell = self.apply_profitability_constraint(
+                    yes_bid, no_bid, q,
+                    market_yes_bid=market_yes_bid,
+                    market_no_bid=market_no_bid
+                )
+
+                # If constraint made our bid uncompetitive, trigger dual exit mode
+                # This places a sell order on the owned side while keeping the constrained bid
+                if constraint_triggered_sell and not self.in_dual_exit_mode and self.pending_exit is None:
+                    owned_side = 'yes' if q > 0 else 'no'
+                    entry_price = self.yes_cost_basis if q > 0 else self.no_cost_basis
+                    self.pending_exit = {
+                        'side': owned_side,
+                        'entry_price': entry_price,
+                        'fill_time': time.time() - self.exit_timeout,  # Pretend timeout already passed
+                        'quantity': abs(q),
+                    }
+                    self.logger.info(f"CONSTRAINT-TRIGGERED EXIT: Entering dual exit mode to sell {owned_side.upper()} "
+                                   f"(constrained opposite bid won't fill at market prices)")
 
             # Log market state (handle None prices from post-only protection)
             def fmt_price(p, decimals=2):
