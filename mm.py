@@ -90,15 +90,18 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
     def _sign_request(self, timestamp: str, method: str, path: str) -> str:
         """Sign the request using RSA-PSS with SHA256."""
-        # Message to sign: timestamp + method + path
-        message = f"{timestamp}{method}{path}"
+        # Strip query parameters from path for signing
+        path_without_query = path.split('?')[0]
+
+        # Message to sign: timestamp + method + path (without query params)
+        message = f"{timestamp}{method}{path_without_query}"
         message_bytes = message.encode('utf-8')
 
         signature = self.private_key.sign(
             message_bytes,
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
+                salt_length=padding.PSS.DIGEST_LENGTH  # Use DIGEST_LENGTH per Kalshi docs
             ),
             hashes.SHA256()
         )
@@ -110,7 +113,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
         # Timestamp in milliseconds
         timestamp = str(int(time.time() * 1000))
 
-        # Sign the request
+        # Sign the request (path without query params)
         signature = self._sign_request(timestamp, method, path)
 
         return {
