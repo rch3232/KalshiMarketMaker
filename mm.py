@@ -1017,6 +1017,9 @@ class AvellanedaMarketMaker:
         exit_profit_target: float = 0.02,  # Target profit when exiting ($0.02)
         position_tracker: SharedPositionTracker = None,  # Cross-market position tracker
         market_ticker: str = None,     # This market's ticker (for cross-market checks)
+        is_incentive: bool = False,    # Whether this is an incentive market
+        heavy_position_threshold: float = 0.5,  # Fraction of max_position that triggers heavy mode
+        heavy_position_max_bid: float = 0.02,   # Max bid price when in heavy position mode
     ):
         self.logger = logger
         self.api = api
@@ -1032,6 +1035,9 @@ class AvellanedaMarketMaker:
         self.flip_skew_factor = flip_skew_factor
         self.exit_timeout = exit_timeout
         self.exit_profit_target = exit_profit_target
+        self.is_incentive = is_incentive
+        self.heavy_position_threshold = heavy_position_threshold
+        self.heavy_position_max_bid = heavy_position_max_bid
 
         # Cross-market position tracking to prevent guaranteed losses
         self.position_tracker = position_tracker or get_shared_position_tracker()
@@ -1308,6 +1314,22 @@ class AvellanedaMarketMaker:
             else:
                 yes_bid = round(yes_bid, 2)
                 no_bid = round(no_bid, 2)
+
+        # HEAVY POSITION HANDLING for incentive markets
+        # When position is too large, cap bids at minimum to avoid adding more risk
+        # while still earning incentive rewards for resting orders
+        if self.is_incentive:
+            heavy_threshold = int(self.max_position * self.heavy_position_threshold)
+            if q > heavy_threshold:
+                # Long YES: cap YES bid at minimum to avoid adding more YES exposure
+                self.logger.info(f"HEAVY POSITION: q={q} > threshold={heavy_threshold}, "
+                               f"capping YES bid at ${self.heavy_position_max_bid:.2f}")
+                yes_bid = self.heavy_position_max_bid
+            elif q < -heavy_threshold:
+                # Long NO: cap NO bid at minimum to avoid adding more NO exposure
+                self.logger.info(f"HEAVY POSITION: q={q} < -{heavy_threshold}, "
+                               f"capping NO bid at ${self.heavy_position_max_bid:.2f}")
+                no_bid = self.heavy_position_max_bid
 
         # Ensure we're at least at market bid (competitive pricing)
         if market_yes_bid > 0 and yes_bid < market_yes_bid:

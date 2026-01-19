@@ -100,6 +100,14 @@ liquidity_incentives:
   # - Spread/order book check: BYPASSED (trade even with wide spreads)
   # - Long shot filter: BYPASSED (trade at any price level)
 
+  # Position limits for incentive markets (overrides market_maker.max_position)
+  max_position: 15             # Max contracts per side for incentive markets
+
+  # Heavy position handling - when position gets too large, cap bids at minimum
+  # to avoid adding more risk while still earning incentive rewards
+  heavy_position_threshold: 0.5  # 50% of max_position triggers heavy mode
+  heavy_position_max_bid: 0.02   # Cap bids at 2¢ when in heavy position mode
+
 # =============================================================================
 # MARKET MAKER PARAMETERS
 # =============================================================================

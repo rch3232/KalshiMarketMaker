@@ -231,7 +231,8 @@ def create_api(api_key: str, private_key: str, base_url: str, market_ticker: str
 
 
 def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.Logger,
-                        market_ticker: str = None):
+                        market_ticker: str = None, is_incentive: bool = False,
+                        incentive_config: Dict = None):
     """Create an AvellanedaMarketMaker with Dual-Quote flipping strategy.
 
     Parameters are calibrated for binary probability markets (0.00-1.00 scale):
@@ -242,7 +243,19 @@ def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.
     - exit_timeout: Seconds before auto-exit triggers for one-sided fills
     - exit_profit_target: Target profit when exiting ($0.02 default)
     - position_tracker: Shared tracker for cross-market conflict prevention
+    - is_incentive: Whether this is an incentive market (uses different position limits)
+    - incentive_config: Config for incentive-specific settings
     """
+    # Use incentive-specific max_position if this is an incentive market
+    if is_incentive and incentive_config:
+        max_position = incentive_config.get('max_position', 15)
+        heavy_position_threshold = incentive_config.get('heavy_position_threshold', 0.5)
+        heavy_position_max_bid = incentive_config.get('heavy_position_max_bid', 0.02)
+    else:
+        max_position = mm_config.get('max_position', 5)
+        heavy_position_threshold = 0.5
+        heavy_position_max_bid = 0.02
+
     return AvellanedaMarketMaker(
         logger=logger,
         api=api,
@@ -250,7 +263,7 @@ def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.
         k=mm_config.get('k', 1.5),
         sigma=mm_config.get('sigma', 0.10),
         T=mm_config.get('T', 3600),
-        max_position=mm_config.get('max_position', 5),
+        max_position=max_position,
         order_expiration=mm_config.get('order_expiration', 300),
         min_spread=mm_config.get('min_spread', 0.02),
         max_spread=mm_config.get('max_spread', 0.10),
@@ -260,6 +273,9 @@ def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.
         exit_profit_target=mm_config.get('exit_profit_target', 0.02),
         position_tracker=get_shared_position_tracker(),
         market_ticker=market_ticker,
+        is_incentive=is_incentive,
+        heavy_position_threshold=heavy_position_threshold,
+        heavy_position_max_bid=heavy_position_max_bid,
     )
 
 
@@ -270,9 +286,16 @@ def run_market_for_duration(
     base_url: str,
     mm_config: Dict,
     dt: float,
-    duration: int
+    duration: int,
+    is_incentive: bool = False,
+    incentive_config: Dict = None
 ):
-    """Run market maker for a specific market for the given duration."""
+    """Run market maker for a specific market for the given duration.
+
+    Args:
+        is_incentive: Whether this is an incentive market (uses different position limits)
+        incentive_config: Config for incentive-specific settings (max_position, heavy thresholds)
+    """
     logger = logging.getLogger(f"MM_{market_ticker}")
     logger.setLevel(logging.INFO)
 
@@ -294,7 +317,8 @@ def run_market_for_duration(
     logger.addHandler(fh)
     logger.addHandler(ch)
 
-    logger.info(f"Starting market maker for {market_ticker}")
+    market_type = "INCENTIVE " if is_incentive else ""
+    logger.info(f"Starting {market_type}market maker for {market_ticker}")
     api = None
 
     try:
@@ -304,7 +328,10 @@ def run_market_for_duration(
         config_with_duration = mm_config.copy()
         config_with_duration['T'] = duration
 
-        market_maker = create_market_maker(config_with_duration, api, logger, market_ticker)
+        market_maker = create_market_maker(
+            config_with_duration, api, logger, market_ticker,
+            is_incentive=is_incentive, incentive_config=incentive_config
+        )
         market_maker.run(dt)
 
     except Exception as e:
@@ -678,7 +705,10 @@ def run_dynamic_strategies(config: Dict):
     runner_logger.info(f"Long shot filter: enabled={longshot_enabled}, range={longshot_price_floor}¢-{longshot_price_ceiling}¢")
     runner_logger.info(f"Liquidity incentives: enabled={incentives_enabled}, refresh=30min")
     if incentives_enabled:
-        runner_logger.info(f"  Incentive markets bypass long shot filter and get priority")
+        runner_logger.info(f"  Incentive markets bypass spread/longshot filters and get priority")
+        runner_logger.info(f"  Incentive max_position: {incentive_config.get('max_position', 15)}")
+        runner_logger.info(f"  Heavy position threshold: {incentive_config.get('heavy_position_threshold', 0.5)}")
+        runner_logger.info(f"  Heavy position max bid: ${incentive_config.get('heavy_position_max_bid', 0.02):.2f}")
 
     active_futures: Dict[str, Future] = {}
 
@@ -765,7 +795,9 @@ def run_dynamic_strategies(config: Dict):
                 # Start market makers for new markets (up to max_concurrent)
                 for ticker in active_tickers:
                     if ticker not in active_futures and len(active_futures) < max_concurrent_markets:
-                        runner_logger.info(f"Starting market maker for {ticker}")
+                        is_incentive = ticker in incentive_tickers
+                        market_type = "INCENTIVE " if is_incentive else ""
+                        runner_logger.info(f"Starting {market_type}market maker for {ticker}")
                         future = executor.submit(
                             run_market_for_duration,
                             ticker,
@@ -774,7 +806,9 @@ def run_dynamic_strategies(config: Dict):
                             base_url,
                             mm_config,
                             dt,
-                            market_duration
+                            market_duration,
+                            is_incentive,
+                            incentive_config
                         )
                         active_futures[ticker] = future
 
