@@ -20,6 +20,11 @@ _rate_limit_lock = threading.Lock()
 _last_api_call_time = 0
 RATE_LIMIT_MS = 100  # milliseconds between calls
 
+# Clock drift correction - offset in milliseconds to add to local time
+# Positive = local clock is behind server, Negative = local clock is ahead
+_time_offset_ms = 0
+_time_offset_lock = threading.Lock()
+
 
 class AbstractTradingAPI(abc.ABC):
     @abc.abstractmethod
@@ -139,6 +144,32 @@ class KalshiTradingAPI(AbstractTradingAPI):
                 time.sleep(sleep_time)
             _last_api_call_time = int(time.time() * 1000)
 
+    def _get_corrected_timestamp_ms(self) -> int:
+        """Get current timestamp in milliseconds, corrected for clock drift."""
+        global _time_offset_ms
+        with _time_offset_lock:
+            return int(time.time() * 1000) + _time_offset_ms
+
+    def _update_time_offset(self, response):
+        """Update clock drift offset based on server's Date header."""
+        global _time_offset_ms
+        server_date = response.headers.get('Date')
+        if server_date:
+            try:
+                from email.utils import parsedate_to_datetime
+                server_time = parsedate_to_datetime(server_date)
+                server_ms = int(server_time.timestamp() * 1000)
+                local_ms = int(time.time() * 1000)
+                drift = server_ms - local_ms
+
+                with _time_offset_lock:
+                    # Only update if drift is significant (> 500ms)
+                    if abs(drift) > 500 and abs(drift - _time_offset_ms) > 100:
+                        self.logger.warning(f"Clock drift detected: {drift}ms (server ahead of local)")
+                        _time_offset_ms = drift
+            except Exception as e:
+                self.logger.debug(f"Could not parse server Date header: {e}")
+
     def _make_request(self, method: str, endpoint: str, data: dict = None) -> dict:
         """Make an authenticated request to the Kalshi API."""
         # Rate limit to avoid exceeding Kalshi API limits
@@ -151,11 +182,15 @@ class KalshiTradingAPI(AbstractTradingAPI):
         # Per Kalshi docs: URL /trade-api/v2/markets?limit=100 signs as /trade-api/v2/markets
         path_for_signing = f"/trade-api/v2{endpoint.split('?')[0]}"
 
-        # Generate timestamp in milliseconds (must be 13 digits)
-        timestamp_ms = int(time.time() * 1000)
+        # Generate timestamp in milliseconds, corrected for any detected clock drift
+        timestamp_ms = self._get_corrected_timestamp_ms()
+
+        # Build the message string for signing (for debug logging)
+        msg_string = f"{timestamp_ms}{method.upper()}{path_for_signing}"
 
         self.logger.debug(f"URL: {url}")
-        self.logger.debug(f"Signing: {timestamp_ms}{method.upper()}{path_for_signing}")
+        self.logger.debug(f"Signing message: {msg_string}")
+        self.logger.debug(f"Timestamp (ms): {timestamp_ms}, Method: {method.upper()}, Path: {path_for_signing}")
         signature = self._sign_request(method.upper(), path_for_signing, timestamp_ms)
 
         headers = {
@@ -165,6 +200,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
             "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
         }
 
+        response = None
         try:
             if method.upper() == "GET":
                 response = requests.get(url, headers=headers, timeout=30)
@@ -175,8 +211,16 @@ class KalshiTradingAPI(AbstractTradingAPI):
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
 
+            # Update clock drift offset from server response
+            self._update_time_offset(response)
+
             if response.status_code == 401:
+                # Log detailed debug info for auth failures
                 self.logger.error(f"Authentication failed: {response.text}")
+                self.logger.error(f"DEBUG - Timestamp sent: {timestamp_ms}")
+                self.logger.error(f"DEBUG - Message signed: {msg_string}")
+                self.logger.error(f"DEBUG - Path: {path_for_signing}")
+                self.logger.error(f"DEBUG - API Key (first 8 chars): {self.api_key[:8]}...")
                 raise Exception(f"Authentication error: {response.text}")
 
             response.raise_for_status()
