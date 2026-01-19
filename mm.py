@@ -26,6 +26,179 @@ _time_offset_ms = 0
 _time_offset_lock = threading.Lock()
 
 
+class SharedPositionTracker:
+    """Thread-safe tracker for cross-market position awareness.
+
+    Prevents the bot from buying the same side (YES or NO) on multiple outcomes
+    of the same event, which would guarantee a loss in binary events.
+
+    Example: In "La Serna vs Arias", if you buy NO on "La Serna wins" AND
+    NO on "Arias wins", you're guaranteed to lose because one must win.
+
+    Usage:
+        tracker = SharedPositionTracker()
+        tracker.update_position("KXFIGHT-19JAN26-LASERNA-ARIAS-LASERNA", -1)  # 1 NO
+        tracker.update_position("KXFIGHT-19JAN26-LASERNA-ARIAS-ARIAS", -1)    # 1 NO
+        # Now tracker.is_blocked("KXFIGHT-19JAN26-LASERNA-ARIAS-ARIAS", "no") returns True
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # positions[ticker] = {'side': 'yes'|'no', 'quantity': int, 'event_prefix': str}
+        self._positions: Dict[str, Dict] = {}
+        # blocked_sides[ticker] = set of blocked sides ('yes' and/or 'no')
+        self._blocked_sides: Dict[str, set] = {}
+        self._logger = logging.getLogger("PositionTracker")
+
+    @staticmethod
+    def extract_event_prefix(ticker: str) -> str:
+        """Extract the event prefix from a ticker to identify related markets.
+
+        Kalshi tickers often follow: SERIES-DATE-EVENT-OUTCOME
+        e.g., KXFIGHT-19JAN26-LASERNA-ARIAS-LASERNA
+
+        We extract everything before the last dash as the event prefix.
+        """
+        parts = ticker.rsplit('-', 1)
+        if len(parts) == 2:
+            return parts[0]
+        return ticker  # No dash found, use whole ticker
+
+    def update_position(self, ticker: str, position: int) -> None:
+        """Update the tracked position for a market and recalculate blocks.
+
+        Args:
+            ticker: Market ticker
+            position: Current position (positive=YES, negative=NO, 0=flat)
+        """
+        with self._lock:
+            event_prefix = self.extract_event_prefix(ticker)
+
+            if position == 0:
+                # Position closed, remove from tracking
+                if ticker in self._positions:
+                    del self._positions[ticker]
+                    self._logger.info(f"Position closed: {ticker}")
+            else:
+                side = 'yes' if position > 0 else 'no'
+                self._positions[ticker] = {
+                    'side': side,
+                    'quantity': abs(position),
+                    'event_prefix': event_prefix,
+                }
+                self._logger.info(f"Position updated: {ticker} = {abs(position)} {side.upper()}")
+
+            # Recalculate blocked sides for all related markets
+            self._recalculate_blocks()
+
+    def _recalculate_blocks(self) -> None:
+        """Recalculate which sides are blocked for each market based on conflicts."""
+        # Group positions by event prefix
+        positions_by_event: Dict[str, List[tuple]] = {}
+        for ticker, pos_data in self._positions.items():
+            event_prefix = pos_data['event_prefix']
+            if event_prefix not in positions_by_event:
+                positions_by_event[event_prefix] = []
+            positions_by_event[event_prefix].append((ticker, pos_data['side']))
+
+        # Clear existing blocks
+        self._blocked_sides.clear()
+
+        # For each event with multiple positions, block the same side on other markets
+        for event_prefix, event_positions in positions_by_event.items():
+            if len(event_positions) <= 1:
+                continue  # Only one market in this event, no conflicts possible
+
+            # Check if any positions exist - if so, block that side on OTHER markets
+            for ticker, side in event_positions:
+                # For all OTHER tickers in this event, block BUYing the same side
+                for other_ticker, _ in event_positions:
+                    if other_ticker != ticker:
+                        if other_ticker not in self._blocked_sides:
+                            self._blocked_sides[other_ticker] = set()
+                        self._blocked_sides[other_ticker].add(side)
+                        self._logger.debug(f"Blocked {side.upper()} buys on {other_ticker} "
+                                          f"(conflict with {ticker})")
+
+    def is_buy_blocked(self, ticker: str, side: str) -> bool:
+        """Check if buying a specific side is blocked due to cross-market conflict.
+
+        Args:
+            ticker: Market ticker to check
+            side: 'yes' or 'no'
+
+        Returns:
+            True if buying this side would create a guaranteed loss
+        """
+        with self._lock:
+            blocked = self._blocked_sides.get(ticker, set())
+            is_blocked = side.lower() in blocked
+
+            if is_blocked:
+                self._logger.warning(f"BUY {side.upper()} blocked on {ticker} - "
+                                    f"would create cross-market conflict")
+            return is_blocked
+
+    def get_conflicts(self) -> List[Dict]:
+        """Get a list of all current cross-market conflicts.
+
+        Returns:
+            List of conflict dictionaries with event_prefix, tickers, and side
+        """
+        with self._lock:
+            conflicts = []
+            positions_by_event: Dict[str, List[tuple]] = {}
+
+            for ticker, pos_data in self._positions.items():
+                event_prefix = pos_data['event_prefix']
+                if event_prefix not in positions_by_event:
+                    positions_by_event[event_prefix] = []
+                positions_by_event[event_prefix].append((ticker, pos_data['side']))
+
+            for event_prefix, event_positions in positions_by_event.items():
+                if len(event_positions) > 1:
+                    sides = set(p[1] for p in event_positions)
+                    if len(sides) == 1:
+                        # All same side = conflict
+                        conflicts.append({
+                            'event_prefix': event_prefix,
+                            'tickers': [p[0] for p in event_positions],
+                            'side': list(sides)[0],
+                        })
+
+            return conflicts
+
+    def initialize_from_positions(self, positions: List[Dict]) -> None:
+        """Initialize tracker from a list of position dictionaries.
+
+        Args:
+            positions: List of dicts with 'ticker' and 'position' keys
+        """
+        with self._lock:
+            self._positions.clear()
+            self._blocked_sides.clear()
+
+        for pos in positions:
+            ticker = pos.get('ticker')
+            position = pos.get('position', 0)
+            if ticker and position != 0:
+                self.update_position(ticker, position)
+
+
+# Global shared position tracker (singleton)
+_shared_position_tracker: SharedPositionTracker = None
+_tracker_lock = threading.Lock()
+
+
+def get_shared_position_tracker() -> SharedPositionTracker:
+    """Get or create the global shared position tracker."""
+    global _shared_position_tracker
+    with _tracker_lock:
+        if _shared_position_tracker is None:
+            _shared_position_tracker = SharedPositionTracker()
+        return _shared_position_tracker
+
+
 class AbstractTradingAPI(abc.ABC):
     @abc.abstractmethod
     def get_price(self) -> float:
@@ -745,6 +918,8 @@ class AvellanedaMarketMaker:
         flip_skew_factor: float = 0.03,  # Aggressive skew for inventory flipping
         exit_timeout: float = 30.0,    # Seconds before auto-exit kicks in
         exit_profit_target: float = 0.02,  # Target profit when exiting ($0.02)
+        position_tracker: SharedPositionTracker = None,  # Cross-market position tracker
+        market_ticker: str = None,     # This market's ticker (for cross-market checks)
     ):
         self.logger = logger
         self.api = api
@@ -760,6 +935,10 @@ class AvellanedaMarketMaker:
         self.flip_skew_factor = flip_skew_factor
         self.exit_timeout = exit_timeout
         self.exit_profit_target = exit_profit_target
+
+        # Cross-market position tracking to prevent guaranteed losses
+        self.position_tracker = position_tracker or get_shared_position_tracker()
+        self.market_ticker = market_ticker or getattr(api, 'market_ticker', 'UNKNOWN')
 
         self.t = 0
         self.active_yes_order_id = None
@@ -1148,8 +1327,15 @@ class AvellanedaMarketMaker:
         self.logger.info(f"ORDER STATE: YES={yes_tracked['order_id'][:8] if yes_tracked else 'none'}@${yes_tracked['price']:.2f if yes_tracked else 0}, "
                         f"NO={no_tracked['order_id'][:8] if no_tracked else 'none'}@${no_tracked['price']:.2f if no_tracked else 0}")
 
+        # Check for cross-market conflicts
+        yes_blocked = self.position_tracker.is_buy_blocked(self.market_ticker, 'yes')
+        no_blocked = self.position_tracker.is_buy_blocked(self.market_ticker, 'no')
+
         # Process YES side
-        if position < position_limit:
+        if yes_blocked:
+            self.logger.info(f"CROSS-MARKET CONFLICT: YES buys blocked on {self.market_ticker}")
+            self._cancel_side_if_exists('yes')
+        elif position < position_limit:
             self._reconcile_side('yes', desired_yes_price, desired_count, expiration_ts, current_time)
         else:
             # At position limit - cancel any YES orders
@@ -1157,7 +1343,10 @@ class AvellanedaMarketMaker:
             self._cancel_side_if_exists('yes')
 
         # Process NO side
-        if position > -position_limit:
+        if no_blocked:
+            self.logger.info(f"CROSS-MARKET CONFLICT: NO buys blocked on {self.market_ticker}")
+            self._cancel_side_if_exists('no')
+        elif position > -position_limit:
             self._reconcile_side('no', desired_no_price, desired_count, expiration_ts, current_time)
         else:
             # At position limit - cancel any NO orders
@@ -1582,6 +1771,9 @@ class AvellanedaMarketMaker:
             market_no_bid = price_data["no_bid"]
             market_no_ask = price_data["no_ask"]
             q = self.api.get_position()
+
+            # Update the cross-market position tracker
+            self.position_tracker.update_position(self.market_ticker, q)
 
             # Compute tick-aware quotes based on market type
             yes_bid, no_bid = self.compute_tick_aware_quotes(

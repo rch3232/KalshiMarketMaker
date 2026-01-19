@@ -8,7 +8,7 @@ import os
 import time
 from typing import Dict, List, Set
 
-from mm import KalshiTradingAPI, AvellanedaMarketMaker
+from mm import KalshiTradingAPI, AvellanedaMarketMaker, get_shared_position_tracker
 
 
 def is_parlay_or_combo_market(market: Dict) -> tuple[bool, str]:
@@ -107,7 +107,8 @@ def create_api(api_key: str, private_key: str, base_url: str, market_ticker: str
     )
 
 
-def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.Logger):
+def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.Logger,
+                        market_ticker: str = None):
     """Create an AvellanedaMarketMaker with Dual-Quote flipping strategy.
 
     Parameters are calibrated for binary probability markets (0.00-1.00 scale):
@@ -117,6 +118,7 @@ def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.
     - flip_skew_factor: Asymmetric urgency for inventory flipping
     - exit_timeout: Seconds before auto-exit triggers for one-sided fills
     - exit_profit_target: Target profit when exiting ($0.02 default)
+    - position_tracker: Shared tracker for cross-market conflict prevention
     """
     return AvellanedaMarketMaker(
         logger=logger,
@@ -133,6 +135,8 @@ def create_market_maker(mm_config: Dict, api: KalshiTradingAPI, logger: logging.
         flip_skew_factor=mm_config.get('flip_skew_factor', 0.03),
         exit_timeout=mm_config.get('exit_timeout', 30.0),
         exit_profit_target=mm_config.get('exit_profit_target', 0.02),
+        position_tracker=get_shared_position_tracker(),
+        market_ticker=market_ticker,
     )
 
 
@@ -177,7 +181,7 @@ def run_market_for_duration(
         config_with_duration = mm_config.copy()
         config_with_duration['T'] = duration
 
-        market_maker = create_market_maker(config_with_duration, api, logger)
+        market_maker = create_market_maker(config_with_duration, api, logger, market_ticker)
         market_maker.run(dt)
 
     except Exception as e:
@@ -287,7 +291,7 @@ def fetch_position_tickers(api_key: str, private_key: str, base_url: str) -> Set
     These markets will be included in the trading list regardless of liquidity
     filters to ensure we manage ALL positions (place sell orders, etc.).
 
-    Also detects potentially conflicting positions (same side on related markets).
+    Also initializes the shared position tracker for cross-market conflict prevention.
 
     Returns:
         Set of ticker strings for markets with non-zero positions
@@ -306,9 +310,10 @@ def fetch_position_tickers(api_key: str, private_key: str, base_url: str) -> Set
 
         positions = temp_api.get_portfolio_positions()
 
-        # Track positions by event prefix for conflict detection
-        # Ticker format often: SERIES-DATE-EVENT-OUTCOME (e.g., KXNFLGAME-26JAN19-KC-HOU-KC)
-        positions_by_event: Dict[str, List[tuple]] = {}
+        # Initialize the shared position tracker with all positions
+        # This enables cross-market conflict detection across all market makers
+        tracker = get_shared_position_tracker()
+        tracker.initialize_from_positions(positions)
 
         for pos in positions:
             ticker = pos.get('ticker')
@@ -318,32 +323,20 @@ def fetch_position_tickers(api_key: str, private_key: str, base_url: str) -> Set
                 side = "YES" if position > 0 else "NO"
                 logger.info(f"Found position in {ticker}: {abs(position)} {side}")
 
-                # Extract event prefix (everything before the last dash, which is often the outcome)
-                # This helps detect related markets in the same event
-                parts = ticker.rsplit('-', 1)
-                if len(parts) == 2:
-                    event_prefix = parts[0]
-                    if event_prefix not in positions_by_event:
-                        positions_by_event[event_prefix] = []
-                    positions_by_event[event_prefix].append((ticker, side, abs(position)))
-
-        # Check for conflicting positions (same side on multiple outcomes of same event)
-        for event_prefix, event_positions in positions_by_event.items():
-            if len(event_positions) > 1:
-                # Multiple positions in related markets - check if they're all same side
-                sides = set(p[1] for p in event_positions)
-                if len(sides) == 1:
-                    # All positions are same side (all YES or all NO) - this is risky!
-                    side = list(sides)[0]
-                    tickers = [p[0] for p in event_positions]
-                    logger.warning(f"⚠️  CONFLICTING POSITIONS DETECTED!")
-                    logger.warning(f"    Event: {event_prefix}")
-                    logger.warning(f"    You have {side} on multiple outcomes: {tickers}")
-                    logger.warning(f"    In a binary event, this may guarantee a loss!")
-                    logger.warning(f"    Consider selling one side to reduce risk.")
+        # Check for and log any existing conflicts
+        conflicts = tracker.get_conflicts()
+        for conflict in conflicts:
+            logger.warning(f"⚠️  CROSS-MARKET CONFLICT DETECTED!")
+            logger.warning(f"    Event: {conflict['event_prefix']}")
+            logger.warning(f"    You have {conflict['side'].upper()} on multiple outcomes: {conflict['tickers']}")
+            logger.warning(f"    In a binary event, this guarantees a loss!")
+            logger.warning(f"    The bot will NOT buy more {conflict['side'].upper()} on related markets.")
+            logger.warning(f"    Consider manually selling one position to reduce risk.")
 
         temp_api.logout()
         logger.info(f"Total markets with positions: {len(position_tickers)}")
+        if conflicts:
+            logger.info(f"Cross-market conflict prevention: {len(conflicts)} conflict(s) detected and blocked")
 
     except Exception as e:
         logger.error(f"Failed to fetch position tickers: {e}")
