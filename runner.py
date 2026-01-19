@@ -16,9 +16,9 @@ import re
 PARLAY_KEYWORDS = re.compile(r'\b(parlay|combo|multi-leg|accumulator)\b', re.IGNORECASE)
 # Pattern to detect "X and Y" connecting different outcomes (e.g., "Team A wins and Team B wins")
 MULTI_OUTCOME_PATTERN = re.compile(r'\b\w+\s+(?:wins?|scores?|over|under)\s+and\s+\w+\s+(?:wins?|scores?|over|under)\b', re.IGNORECASE)
-# Pattern to detect player prop parlays: "yes X: N+,yes Y: M+" format
-# Matches patterns like "yes Stephon Castle: 4+,yes De'Aaron Fox: 10+"
-PLAYER_PROP_PARLAY_PATTERN = re.compile(r'yes\s+[^,]+:\s*\d+\+?\s*,\s*yes\s+', re.IGNORECASE)
+# Pattern to detect multi-leg parlays with comma-separated yes/no conditions
+# Matches: "yes X: 10+,no Y wins by...", "yes X: 25+,yes Y: 30+", etc.
+MULTI_LEG_PARLAY_PATTERN = re.compile(r'(?:yes|no)\s+[^,]+,\s*(?:yes|no)\s+', re.IGNORECASE)
 
 
 def is_parlay_or_combo_market(market: Dict) -> tuple[bool, str]:
@@ -56,9 +56,9 @@ def is_parlay_or_combo_market(market: Dict) -> tuple[bool, str]:
     if MULTI_OUTCOME_PATTERN.search(combined_text):
         return True, f"multi-outcome pattern in title/subtitle: {combined_text[:50]}"
 
-    # Check 6: Player prop parlay pattern (e.g., "yes Stephon Castle: 4+,yes De'Aaron Fox: 10+")
-    if PLAYER_PROP_PARLAY_PATTERN.search(combined_text):
-        return True, f"player prop parlay pattern in title/subtitle: {combined_text[:80]}"
+    # Check 6: Multi-leg parlay pattern (e.g., "yes X: 10+,no Y wins by...", "yes X: 25+,yes Y: 30+")
+    if MULTI_LEG_PARLAY_PATTERN.search(combined_text):
+        return True, f"multi-leg parlay pattern in title/subtitle: {combined_text[:80]}"
 
     # Check 7: Multiple " and " conjunctions suggesting combined bets
     # Count occurrences of " and " that might indicate multiple legs
@@ -67,6 +67,39 @@ def is_parlay_or_combo_market(market: Dict) -> tuple[bool, str]:
         return True, f"multiple 'and' conjunctions ({and_count}): {combined_text[:50]}"
 
     return False, ""
+
+
+def check_market_liquidity(market: Dict, min_volume: int = 0, max_spread_cents: int = 50) -> tuple[bool, str]:
+    """Check if a market meets liquidity requirements.
+
+    Args:
+        market: Market data from API
+        min_volume: Minimum 24h volume required (0 = disabled)
+        max_spread_cents: Maximum bid-ask spread in cents (default 50 = skip if spread > 50¢)
+
+    Returns:
+        tuple of (is_liquid: bool, reason: str if not liquid)
+    """
+    # Get bid/ask data
+    yes_bid = market.get('yes_bid', 0) or 0
+    yes_ask = market.get('yes_ask', 0) or 0
+
+    # Check 1: Must have both bid and ask (not an empty order book)
+    if yes_bid == 0 or yes_ask == 0:
+        return False, f"empty order book (yes_bid={yes_bid}, yes_ask={yes_ask})"
+
+    # Check 2: Spread must not be too wide
+    spread = yes_ask - yes_bid
+    if spread > max_spread_cents:
+        return False, f"spread too wide ({spread}¢ > {max_spread_cents}¢ max)"
+
+    # Check 3: Volume check (if enabled)
+    if min_volume > 0:
+        volume = market.get('volume', 0) or market.get('volume_24h', 0) or 0
+        if volume < min_volume:
+            return False, f"volume too low ({volume} < {min_volume} min)"
+
+    return True, ""
 
 
 def cleanup_logger(logger: logging.Logger):
@@ -203,8 +236,18 @@ def test_api_connection(api_key: str, private_key: str, base_url: str) -> bool:
         return False
 
 
-def fetch_active_markets(series_list: List[str], api_key: str, private_key: str, base_url: str) -> List[str]:
-    """Fetch all active market tickers for the given series list."""
+def fetch_active_markets(series_list: List[str], api_key: str, private_key: str, base_url: str,
+                         min_volume: int = 0, max_spread_cents: int = 50) -> List[str]:
+    """Fetch all active market tickers for the given series list.
+
+    Args:
+        series_list: List of series tickers to fetch
+        api_key: Kalshi API key
+        private_key: Kalshi private key
+        base_url: Kalshi API base URL
+        min_volume: Minimum volume required (0 = disabled)
+        max_spread_cents: Maximum bid-ask spread in cents (default 50)
+    """
     logger = logging.getLogger("MarketFetcher")
     active_tickers = []
 
@@ -219,7 +262,8 @@ def fetch_active_markets(series_list: List[str], api_key: str, private_key: str,
             logger=logger
         )
 
-        skipped_count = 0
+        skipped_parlay = 0
+        skipped_liquidity = 0
         for series in series_list:
             try:
                 markets = temp_api.get_active_markets_by_series(series)
@@ -232,7 +276,14 @@ def fetch_active_markets(series_list: List[str], api_key: str, private_key: str,
                     is_parlay, reason = is_parlay_or_combo_market(market)
                     if is_parlay:
                         logger.info(f"Skipping parlay/combo market: {ticker} - {reason}")
-                        skipped_count += 1
+                        skipped_parlay += 1
+                        continue
+
+                    # Check liquidity requirements
+                    is_liquid, liq_reason = check_market_liquidity(market, min_volume, max_spread_cents)
+                    if not is_liquid:
+                        logger.info(f"Skipping illiquid market: {ticker} - {liq_reason}")
+                        skipped_liquidity += 1
                         continue
 
                     active_tickers.append(ticker)
@@ -241,7 +292,7 @@ def fetch_active_markets(series_list: List[str], api_key: str, private_key: str,
             except Exception as e:
                 logger.error(f"Failed to fetch markets for series {series}: {e}")
 
-        logger.info(f"Total markets found: {len(active_tickers)} (skipped {skipped_count} parlay/combo markets)")
+        logger.info(f"Total markets found: {len(active_tickers)} (skipped {skipped_parlay} parlays, {skipped_liquidity} illiquid)")
 
         temp_api.logout()
 
@@ -251,7 +302,8 @@ def fetch_active_markets(series_list: List[str], api_key: str, private_key: str,
     return active_tickers
 
 
-def fetch_active_markets_by_category(category: str, api_key: str, private_key: str, base_url: str) -> List[str]:
+def fetch_active_markets_by_category(category: str, api_key: str, private_key: str, base_url: str,
+                                      min_volume: int = 0, max_spread_cents: int = 50) -> List[str]:
     """Fetch all active market tickers for a category (e.g., 'Sports').
 
     This function fetches ALL sports markets at once without needing to know
@@ -262,6 +314,8 @@ def fetch_active_markets_by_category(category: str, api_key: str, private_key: s
         api_key: Kalshi API key
         private_key: Kalshi private key (bytes or string)
         base_url: Kalshi API base URL
+        min_volume: Minimum volume required (0 = disabled)
+        max_spread_cents: Maximum bid-ask spread in cents (default 50)
 
     Returns:
         List of active market ticker strings
@@ -279,7 +333,8 @@ def fetch_active_markets_by_category(category: str, api_key: str, private_key: s
         )
 
         markets = temp_api.get_active_markets_by_category(category)
-        skipped_count = 0
+        skipped_parlay = 0
+        skipped_liquidity = 0
         for market in markets:
             ticker = market.get('ticker')
             if not ticker:
@@ -289,7 +344,14 @@ def fetch_active_markets_by_category(category: str, api_key: str, private_key: s
             is_parlay, reason = is_parlay_or_combo_market(market)
             if is_parlay:
                 logger.info(f"Skipping parlay/combo market: {ticker} - {reason}")
-                skipped_count += 1
+                skipped_parlay += 1
+                continue
+
+            # Check liquidity requirements
+            is_liquid, liq_reason = check_market_liquidity(market, min_volume, max_spread_cents)
+            if not is_liquid:
+                logger.info(f"Skipping illiquid market: {ticker} - {liq_reason}")
+                skipped_liquidity += 1
                 continue
 
             active_tickers.append(ticker)
@@ -300,7 +362,7 @@ def fetch_active_markets_by_category(category: str, api_key: str, private_key: s
             logger.info(f"Found active market: {ticker} - {title} {subtitle}".strip())
 
         temp_api.logout()
-        logger.info(f"Total markets found in category '{category}': {len(active_tickers)} (skipped {skipped_count} parlay/combo markets)")
+        logger.info(f"Total markets found in category '{category}': {len(active_tickers)} (skipped {skipped_parlay} parlays, {skipped_liquidity} illiquid)")
 
     except Exception as e:
         logger.error(f"Failed to fetch markets for category {category}: {e}")
@@ -356,6 +418,11 @@ def run_dynamic_strategies(config: Dict):
     market_duration = config.get('market_duration', 3600)  # 1 hour per market cycle
     max_concurrent_markets = config.get('max_concurrent_markets', 10)
 
+    # Liquidity filter settings
+    liquidity_config = config.get('liquidity_filter', {})
+    min_volume = liquidity_config.get('min_volume', 0)  # 0 = disabled
+    max_spread_cents = liquidity_config.get('max_spread_cents', 50)  # Skip if spread > 50¢
+
     runner_logger.info(f"Starting dynamic market maker")
     if category:
         runner_logger.info(f"Market discovery mode: CATEGORY ('{category}')")
@@ -366,6 +433,7 @@ def run_dynamic_strategies(config: Dict):
     runner_logger.info(f"Refresh interval: {refresh_interval}s")
     runner_logger.info(f"Market duration per cycle: {market_duration}s")
     runner_logger.info(f"Max concurrent markets: {max_concurrent_markets}")
+    runner_logger.info(f"Liquidity filter: min_volume={min_volume}, max_spread={max_spread_cents}¢")
 
     active_futures: Dict[str, Future] = {}
 
@@ -375,9 +443,13 @@ def run_dynamic_strategies(config: Dict):
                 # Fetch current active markets using category or series approach
                 runner_logger.info("Fetching active markets...")
                 if category:
-                    active_tickers = fetch_active_markets_by_category(category, api_key, private_key, base_url)
+                    active_tickers = fetch_active_markets_by_category(
+                        category, api_key, private_key, base_url, min_volume, max_spread_cents
+                    )
                 else:
-                    active_tickers = fetch_active_markets(series_list, api_key, private_key, base_url)
+                    active_tickers = fetch_active_markets(
+                        series_list, api_key, private_key, base_url, min_volume, max_spread_cents
+                    )
                 runner_logger.info(f"Found {len(active_tickers)} active markets")
 
                 # Clean up completed futures and check for exceptions

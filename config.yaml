@@ -48,6 +48,21 @@ dt: 2.0
 max_concurrent_markets: 10
 
 # =============================================================================
+# LIQUIDITY FILTER
+# =============================================================================
+# Skip markets that don't meet minimum liquidity requirements
+
+liquidity_filter:
+  # Minimum 24h volume required (0 = disabled)
+  # Set to e.g. 100 to skip markets with < 100 contracts traded
+  min_volume: 0
+
+  # Maximum bid-ask spread in cents
+  # Markets with spreads wider than this are skipped (likely illiquid)
+  # 50 = skip if spread > 50¢
+  max_spread_cents: 50
+
+# =============================================================================
 # MARKET MAKER PARAMETERS
 # =============================================================================
 
