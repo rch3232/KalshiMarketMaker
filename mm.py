@@ -302,16 +302,47 @@ class KalshiTradingAPI(AbstractTradingAPI):
             response = self._make_request("GET", f"/markets/{self.market_ticker}")
             market = response.get("market", {})
 
-            yes_bid = float(market.get("yes_bid", 0)) / 100
-            yes_ask = float(market.get("yes_ask", 0)) / 100
-            no_bid = float(market.get("no_bid", 0)) / 100
-            no_ask = float(market.get("no_ask", 0)) / 100
+            # Get raw bid/ask values (in cents)
+            yes_bid_raw = market.get("yes_bid", 0) or 0
+            yes_ask_raw = market.get("yes_ask", 0) or 0
+            no_bid_raw = market.get("no_bid", 0) or 0
+            no_ask_raw = market.get("no_ask", 0) or 0
 
-            yes_mid_price = round((yes_bid + yes_ask) / 2, 2)
-            no_mid_price = round((no_bid + no_ask) / 2, 2)
+            # Log raw values for diagnostics
+            self.logger.debug(f"Raw market data: yes_bid={yes_bid_raw}, yes_ask={yes_ask_raw}, "
+                             f"no_bid={no_bid_raw}, no_ask={no_ask_raw}")
 
-            self.logger.info(f"Current yes mid-market price: ${yes_mid_price:.2f}")
-            self.logger.info(f"Current no mid-market price: ${no_mid_price:.2f}")
+            # Convert to decimal (0-1 scale)
+            yes_bid = float(yes_bid_raw) / 100
+            yes_ask = float(yes_ask_raw) / 100
+
+            # Calculate mid-price with fallback handling for illiquid markets
+            if yes_bid > 0 and yes_ask > 0:
+                # Normal case: both bid and ask exist
+                yes_mid_price = round((yes_bid + yes_ask) / 2, 2)
+            elif yes_ask > 0:
+                # Only ask exists (no bids) - use ask with buffer
+                yes_mid_price = round(yes_ask - 0.05, 2)
+                self.logger.warning(f"No YES bids, using ask-based mid: ${yes_mid_price:.2f}")
+            elif yes_bid > 0:
+                # Only bid exists (no asks) - use bid with buffer
+                yes_mid_price = round(yes_bid + 0.05, 2)
+                self.logger.warning(f"No YES asks, using bid-based mid: ${yes_mid_price:.2f}")
+            else:
+                # No bid or ask - try last_price or default to 0.50
+                last_price = market.get("last_price", 0) or 0
+                if last_price > 0:
+                    yes_mid_price = round(float(last_price) / 100, 2)
+                    self.logger.warning(f"No bid/ask data, using last_price: ${yes_mid_price:.2f}")
+                else:
+                    yes_mid_price = 0.50
+                    self.logger.warning(f"No market data available, defaulting to ${yes_mid_price:.2f}")
+
+            # Ensure mid-price is within valid bounds
+            yes_mid_price = max(0.05, min(0.95, yes_mid_price))
+            no_mid_price = round(1 - yes_mid_price, 2)
+
+            self.logger.info(f"Market mid-prices: YES=${yes_mid_price:.2f}, NO=${no_mid_price:.2f}")
             return {"yes": yes_mid_price, "no": no_mid_price}
         except Exception as e:
             self.logger.error(f"Failed to get price: {e}")
