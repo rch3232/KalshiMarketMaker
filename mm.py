@@ -38,20 +38,26 @@ class AbstractTradingAPI(abc.ABC):
 class KalshiTradingAPI(AbstractTradingAPI):
     """Kalshi Trading API with direct RSA-PSS signature implementation."""
 
-    # Always use the official Kalshi API domain
-    API_BASE = "https://api.elections.kalshi.com"
-
     def __init__(
         self,
         api_key: str,
         private_key: str,
         market_ticker: str,
-        base_url: str,  # kept for compatibility but not used
+        base_url: str,
         logger: logging.Logger,
     ):
         self.api_key = api_key
         self.market_ticker = market_ticker
         self.logger = logger
+
+        # Set up base URL - strip /trade-api/v2 if provided, we'll add it in requests
+        # Demo: https://demo-api.kalshi.co
+        # Production: https://api.elections.kalshi.com
+        if base_url:
+            self.host = base_url.rstrip('/').replace('/trade-api/v2', '')
+        else:
+            self.host = "https://api.elections.kalshi.com"
+        self.logger.info(f"Using API host: {self.host}")
 
         # Normalize and load the private key
         private_key_pem = self._normalize_pem_key(private_key, logger)
@@ -93,7 +99,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
         """Generate RSA-PSS signature for Kalshi API request."""
         # Message format: timestamp_ms + method + path (per Kalshi docs)
         message = f"{timestamp_ms}{method}{path}"
-        self.logger.info(f"Signing message: {message}")
+        self.logger.debug(f"Signing message: {message}")
 
         # Use PSS.DIGEST_LENGTH constant as per official Kalshi SDK
         signature = self.private_key.sign(
@@ -109,9 +115,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
     def _make_request(self, method: str, endpoint: str, data: dict = None) -> dict:
         """Make an authenticated request to the Kalshi API."""
-        # Build full URL
-        base_url = "https://api.elections.kalshi.com/trade-api/v2"
-        url = f"{base_url}{endpoint}"
+        # Build full URL: host + /trade-api/v2 + endpoint
+        url = f"{self.host}/trade-api/v2{endpoint}"
 
         # For signing: MUST include /trade-api/v2, strip query params
         # Per Kalshi docs: URL /trade-api/v2/markets?limit=100 signs as /trade-api/v2/markets
@@ -120,8 +125,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
         # Generate timestamp in milliseconds (must be 13 digits)
         timestamp_ms = int(time.time() * 1000)
 
-        self.logger.error(f"DEBUG - URL: {url}")
-        self.logger.error(f"DEBUG - Signing: {timestamp_ms}{method.upper()}{path_for_signing}")
+        self.logger.debug(f"URL: {url}")
+        self.logger.debug(f"Signing: {timestamp_ms}{method.upper()}{path_for_signing}")
         signature = self._sign_request(method.upper(), path_for_signing, timestamp_ms)
 
         headers = {
