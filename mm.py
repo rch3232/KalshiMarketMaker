@@ -437,6 +437,13 @@ class KalshiTradingAPI(AbstractTradingAPI):
                 self.logger.error(f"DEBUG - API Key (first 8 chars): {self.api_key[:8]}...")
                 raise Exception(f"Authentication error: {response.text}")
 
+            if response.status_code == 400:
+                # Log detailed error info for Bad Request errors
+                self.logger.error(f"Bad Request (400): {response.text}")
+                if data:
+                    self.logger.error(f"DEBUG - Request data: {data}")
+                raise Exception(f"Bad Request: {response.text}")
+
             response.raise_for_status()
             return response.json() if response.text else {}
 
