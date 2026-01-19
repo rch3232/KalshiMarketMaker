@@ -72,8 +72,8 @@ market_maker:
   position_limit_buffer: 0.1   # 10% buffer near limits
 
   # Spread settings (hard adaptive caps)
-  min_spread: 0.02             # $0.02 minimum spread
-  max_spread: 0.10             # $0.10 maximum spread
+  min_spread: 0.01             # $0.01 minimum spread (bid 0.5¢ below mid)
+  max_spread: 0.04             # $0.04 maximum spread (bid max 2¢ below mid)
 
   # Avellaneda-Stoikov parameters (calibrated for 0.00-1.00 probability scale)
   gamma: 0.02                  # Risk aversion (scaled down: 0.01-0.05 range)
