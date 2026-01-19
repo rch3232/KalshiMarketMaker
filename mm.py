@@ -1,6 +1,7 @@
 import abc
 import time
 import re
+import base64
 import requests
 import json
 from typing import Dict, List, Tuple
@@ -88,9 +89,9 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
     def _sign_request(self, method: str, path: str, timestamp_ms: int) -> str:
         """Generate RSA-PSS signature for Kalshi API request."""
-        # Message format: timestamp_ms + method + path
+        # Message format: timestamp_ms + method + path (per Kalshi docs)
         message = f"{timestamp_ms}{method}{path}"
-        self.logger.debug(f"Signing message: {message}")
+        self.logger.info(f"Signing message: {message}")
 
         signature = self.private_key.sign(
             message.encode('utf-8'),
@@ -101,7 +102,6 @@ class KalshiTradingAPI(AbstractTradingAPI):
             hashes.SHA256()
         )
 
-        import base64
         return base64.b64encode(signature).decode('utf-8')
 
     def _make_request(self, method: str, endpoint: str, data: dict = None) -> dict:
@@ -109,13 +109,15 @@ class KalshiTradingAPI(AbstractTradingAPI):
         # Build full URL
         url = f"{self.base_url}{endpoint}"
 
-        # Generate timestamp in milliseconds
+        # Generate timestamp in milliseconds (must be 13 digits)
         timestamp_ms = int(time.time() * 1000)
 
         # For signing: strip query params and prepend /trade-api/v2
         path_for_signing = endpoint.split('?')[0]  # Remove query params
         path_for_signing = f"/trade-api/v2{path_for_signing}"  # Add API prefix
 
+        self.logger.info(f"Request URL: {url}")
+        self.logger.info(f"Timestamp (ms): {timestamp_ms} ({len(str(timestamp_ms))} digits)")
         self.logger.info(f"Signing path: {path_for_signing}")
         signature = self._sign_request(method.upper(), path_for_signing, timestamp_ms)
 
