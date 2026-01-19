@@ -1,5 +1,6 @@
 import abc
 import time
+import re
 from typing import Dict, List, Tuple
 import logging
 import uuid
@@ -45,8 +46,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.logger = logger
         self.base_url = base_url
 
-        # Handle escaped newlines from environment variables
-        private_key = private_key.replace('\\n', '\n')
+        # Normalize the private key PEM format
+        private_key = self._normalize_pem_key(private_key, logger)
 
         # Configure official Kalshi client with proper host URL
         config = Configuration()
@@ -57,6 +58,41 @@ class KalshiTradingAPI(AbstractTradingAPI):
         # Initialize official Kalshi client
         self.client = KalshiClient(configuration=config)
         self.logger.info(f"API key authentication initialized via official Kalshi client (host: {base_url})")
+
+    @staticmethod
+    def _normalize_pem_key(key: str, logger: logging.Logger) -> str:
+        """Normalize a PEM key that may have various formatting issues from env vars."""
+        # Handle various newline escape formats
+        key = key.replace('\\n', '\n')
+        key = key.replace('\\r', '')
+
+        # Remove any carriage returns
+        key = key.replace('\r', '')
+
+        # If the key is all on one line (no newlines), try to reconstruct it
+        if '\n' not in key or key.count('\n') < 3:
+            logger.info("PEM key appears to be on single line, reconstructing...")
+            # Extract the header, data, and footer
+            match = re.match(r'(-----BEGIN [A-Z ]+-----)(.+)(-----END [A-Z ]+-----)', key.replace(' ', ''))
+            if match:
+                header, data, footer = match.groups()
+                # Split data into 64-character lines
+                data_lines = [data[i:i+64] for i in range(0, len(data), 64)]
+                key = header + '\n' + '\n'.join(data_lines) + '\n' + footer + '\n'
+                logger.info("PEM key reconstructed successfully")
+            else:
+                logger.warning("Could not parse PEM key structure")
+
+        # Ensure proper line endings
+        lines = key.strip().split('\n')
+        key = '\n'.join(line.strip() for line in lines) + '\n'
+
+        # Log first and last lines for debugging (not the actual key data)
+        if lines:
+            logger.info(f"PEM key starts with: {lines[0][:30]}...")
+            logger.info(f"PEM key ends with: {lines[-1][:30]}...")
+
+        return key
 
     def logout(self):
         """No logout needed for API key auth - included for compatibility."""
