@@ -99,11 +99,10 @@ class KalshiTradingAPI(AbstractTradingAPI):
         # Strip query parameters from path for signing
         path_without_query = path.split('?')[0]
 
-        # Full path includes the API prefix (e.g., /trade-api/v2/portfolio/positions)
-        full_path = self.path_prefix + path_without_query
-
-        # Message to sign: timestamp + method + full_path (without query params)
-        message = f"{timestamp}{method}{full_path}"
+        # Message to sign: timestamp + method + path (just the endpoint, no API prefix)
+        # The path should be like "/portfolio/positions" not "/trade-api/v2/portfolio/positions"
+        message = f"{timestamp}{method}{path_without_query}"
+        self.logger.info(f"Signing: {message}")
         message_bytes = message.encode('utf-8')
 
         signature = self.private_key.sign(
