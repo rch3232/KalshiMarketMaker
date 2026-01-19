@@ -437,18 +437,27 @@ class KalshiTradingAPI(AbstractTradingAPI):
                 self.logger.error(f"DEBUG - API Key (first 8 chars): {self.api_key[:8]}...")
                 raise Exception(f"Authentication error: {response.text}")
 
-            if response.status_code == 400:
-                # Log detailed error info for Bad Request errors
-                self.logger.error(f"Bad Request (400): {response.text}")
+            # Handle all 4xx/5xx errors with detailed logging
+            if response.status_code >= 400:
+                error_body = response.text
+                self.logger.error(f"HTTP {response.status_code} Error: {error_body}")
                 if data:
-                    self.logger.error(f"DEBUG - Request data: {data}")
-                raise Exception(f"Bad Request: {response.text}")
+                    self.logger.error(f"Request data that caused error: {data}")
+                # Try to parse error details from JSON response
+                try:
+                    error_json = response.json()
+                    if 'error' in error_json:
+                        self.logger.error(f"API Error details: {error_json['error']}")
+                    if 'message' in error_json:
+                        self.logger.error(f"API Error message: {error_json['message']}")
+                except:
+                    pass  # Response wasn't JSON
+                raise Exception(f"HTTP {response.status_code}: {error_body}")
 
-            response.raise_for_status()
             return response.json() if response.text else {}
 
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Request failed: {e}")
+            self.logger.error(f"Network request failed: {e}")
             raise
 
     def logout(self):
@@ -1164,7 +1173,8 @@ class AvellanedaMarketMaker:
             self.use_subpenny = False
 
     def compute_tick_aware_quotes(self, yes_mid: float, q: int, t: float,
-                                   market_yes_bid: float = 0, market_no_bid: float = 0) -> Tuple[float, float]:
+                                   market_yes_bid: float = 0, market_no_bid: float = 0,
+                                   market_yes_ask: float = 1.0, market_no_ask: float = 1.0) -> Tuple[float, float]:
         """Compute bid prices based on market tick size.
 
         Pricing Strategy:
@@ -1229,6 +1239,23 @@ class AvellanedaMarketMaker:
         # Final clamp
         yes_bid = max(0.02, min(0.98, yes_bid))
         no_bid = max(0.02, min(0.98, no_bid))
+
+        # POST-ONLY PROTECTION: Ensure bid < ask to prevent crossing rejection
+        # Kalshi rejects post_only orders that would immediately fill (400 error)
+        tick = self.min_tick_size if self.min_tick_size else 0.01
+        if market_yes_ask > 0 and yes_bid >= market_yes_ask:
+            # Our bid would cross - set it one tick below ask
+            yes_bid = market_yes_ask - tick
+            yes_bid = max(0.02, round(yes_bid / tick) * tick)  # Round to tick and clamp
+            self.logger.info(f"POST-ONLY PROTECTION: YES bid would cross ask ${market_yes_ask:.3f}, "
+                           f"reduced to ${yes_bid:.3f}")
+
+        if market_no_ask > 0 and no_bid >= market_no_ask:
+            # Our bid would cross - set it one tick below ask
+            no_bid = market_no_ask - tick
+            no_bid = max(0.02, round(no_bid / tick) * tick)  # Round to tick and clamp
+            self.logger.info(f"POST-ONLY PROTECTION: NO bid would cross ask ${market_no_ask:.3f}, "
+                           f"reduced to ${no_bid:.3f}")
 
         return yes_bid, no_bid
 
@@ -1792,6 +1819,8 @@ class AvellanedaMarketMaker:
                 yes_mid, q, self.t,
                 market_yes_bid=market_yes_bid,
                 market_no_bid=market_no_bid,
+                market_yes_ask=market_yes_ask,
+                market_no_ask=market_no_ask,
             )
 
             # Detect fills and track for auto-exit
