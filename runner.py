@@ -287,6 +287,8 @@ def fetch_position_tickers(api_key: str, private_key: str, base_url: str) -> Set
     These markets will be included in the trading list regardless of liquidity
     filters to ensure we manage ALL positions (place sell orders, etc.).
 
+    Also detects potentially conflicting positions (same side on related markets).
+
     Returns:
         Set of ticker strings for markets with non-zero positions
     """
@@ -303,6 +305,11 @@ def fetch_position_tickers(api_key: str, private_key: str, base_url: str) -> Set
         )
 
         positions = temp_api.get_portfolio_positions()
+
+        # Track positions by event prefix for conflict detection
+        # Ticker format often: SERIES-DATE-EVENT-OUTCOME (e.g., KXNFLGAME-26JAN19-KC-HOU-KC)
+        positions_by_event: Dict[str, List[tuple]] = {}
+
         for pos in positions:
             ticker = pos.get('ticker')
             if ticker:
@@ -310,6 +317,30 @@ def fetch_position_tickers(api_key: str, private_key: str, base_url: str) -> Set
                 position_tickers.add(ticker)
                 side = "YES" if position > 0 else "NO"
                 logger.info(f"Found position in {ticker}: {abs(position)} {side}")
+
+                # Extract event prefix (everything before the last dash, which is often the outcome)
+                # This helps detect related markets in the same event
+                parts = ticker.rsplit('-', 1)
+                if len(parts) == 2:
+                    event_prefix = parts[0]
+                    if event_prefix not in positions_by_event:
+                        positions_by_event[event_prefix] = []
+                    positions_by_event[event_prefix].append((ticker, side, abs(position)))
+
+        # Check for conflicting positions (same side on multiple outcomes of same event)
+        for event_prefix, event_positions in positions_by_event.items():
+            if len(event_positions) > 1:
+                # Multiple positions in related markets - check if they're all same side
+                sides = set(p[1] for p in event_positions)
+                if len(sides) == 1:
+                    # All positions are same side (all YES or all NO) - this is risky!
+                    side = list(sides)[0]
+                    tickers = [p[0] for p in event_positions]
+                    logger.warning(f"⚠️  CONFLICTING POSITIONS DETECTED!")
+                    logger.warning(f"    Event: {event_prefix}")
+                    logger.warning(f"    You have {side} on multiple outcomes: {tickers}")
+                    logger.warning(f"    In a binary event, this may guarantee a loss!")
+                    logger.warning(f"    Consider selling one side to reduce risk.")
 
         temp_api.logout()
         logger.info(f"Total markets with positions: {len(position_tickers)}")

@@ -1326,28 +1326,20 @@ class AvellanedaMarketMaker:
                 # 1. Our sell order filled (exit complete)
                 # 2. Opposite side bid filled (pair trade complete)
                 if self.in_dual_exit_mode and current_position == 0:
-                    # Check if exit order is still active
-                    if self._is_exit_order_active():
-                        # Exit order NOT filled, so opposite side bid must have filled
-                        # This means we've completed a pair trade - hold both to expiry!
-                        self.logger.info(f"PAIR TRADE COMPLETED! Bought opposite side while holding {pending_side.upper()}")
-                        self.logger.info(f"Holding both YES and NO until expiry for guaranteed spread profit")
-                        self.holding_pair = True
-                        # Cancel the exit sell order since we're holding
-                        try:
-                            self.api.cancel_order(self.active_exit_order_id)
-                            self.logger.info(f"Canceled exit sell order - now holding pair to expiry")
-                        except Exception as e:
-                            self.logger.warning(f"Could not cancel exit order: {e}")
-                        self.pending_exit = None
-                        self.active_exit_order_id = None
-                        self.in_dual_exit_mode = False
-                    else:
-                        # Exit order filled - normal exit
-                        self.logger.info(f"EXIT COMPLETE: Sold {pending_side.upper()} position")
-                        self.pending_exit = None
-                        self.active_exit_order_id = None
-                        self.in_dual_exit_mode = False
+                    # Position went to 0 while in dual exit mode
+                    # IMPORTANT: In Kalshi, YES and NO cancel out - you can't hold both
+                    # So position=0 means we exited, not that we "hold a pair"
+                    # The "pair trade" concept doesn't apply to Kalshi's settlement model
+                    #
+                    # We'll treat this as a successful exit and resume normal trading
+                    self.logger.info(f"EXIT COMPLETE: Position now flat (was {pending_side.upper()})")
+                    self.logger.info(f"Resuming normal dual-sided quoting")
+                    self.pending_exit = None
+                    self.active_exit_order_id = None
+                    self.in_dual_exit_mode = False
+                    # DO NOT set holding_pair - that would stop all trading!
+                    # holding_pair was designed for exchanges where you can hold both sides
+                    # but Kalshi nets positions, so if position=0, we've exited
                 else:
                     # Not in dual exit mode or position not yet 0
                     self.logger.info(f"POSITION FLATTENING: Opposite side filled, clearing pending exit")
@@ -1400,9 +1392,12 @@ class AvellanedaMarketMaker:
             'dual_exit' - Exit order placed, continue bidding on opposite side
             'holding' - Pair trade completed, holding both sides
         """
-        # If already holding a pair, don't do anything
+        # Legacy holding_pair check - this should never be True in Kalshi's model
+        # since YES and NO net out. If it's somehow set, log warning and reset it.
         if self.holding_pair:
-            return 'holding'
+            self.logger.warning(f"holding_pair was True but Kalshi nets positions. "
+                              f"Resetting to False and resuming trading.")
+            self.holding_pair = False
 
         if self.pending_exit is None:
             self.in_dual_exit_mode = False
@@ -1456,6 +1451,7 @@ class AvellanedaMarketMaker:
             market_ask = market_no_ask
 
         ideal_exit = cost_basis + 0.01  # 1 cent profit
+        max_loss_tolerance = 0.05  # Maximum 5 cent loss we'll accept to exit
 
         # Determine competitive price (at or just below current ask)
         if market_ask > 0:
@@ -1464,9 +1460,10 @@ class AvellanedaMarketMaker:
             competitive_price = 0.99  # Fallback if no ask data
 
         # Exit pricing logic:
-        # 1. If we can exit at profit AND be competitive: use cost + 1¢
-        # 2. If market moved against us: use competitive price (accept loss to exit)
-        # 3. Never price above 0.98 (leave room for spread)
+        # 1. If we can exit at profit: use cost + 1¢
+        # 2. If market moved against us but within tolerance: use competitive price
+        # 3. If market moved too much against us: use cost - max_loss (won't chase)
+        # This prevents selling at huge losses just to exit
 
         if ideal_exit <= competitive_price:
             # We can get our profit and still be at/below market ask
@@ -1474,13 +1471,21 @@ class AvellanedaMarketMaker:
             self.logger.info(f"Exit at profit: cost=${cost_basis:.2f} + 1¢ = ${exit_price:.2f} "
                            f"(market ask=${market_ask:.2f})")
         else:
-            # Market has moved against us - price competitively to actually fill
-            # Use market ask price to be the best offer
-            exit_price = round(competitive_price, 2)
-            potential_loss = cost_basis - exit_price
-            self.logger.info(f"Exit at market: market moved against us. "
-                           f"cost=${cost_basis:.2f}, exit=${exit_price:.2f} "
-                           f"(loss=${potential_loss:.2f})")
+            # Market has moved against us - check how much
+            potential_loss = cost_basis - competitive_price
+
+            if potential_loss <= max_loss_tolerance:
+                # Loss is acceptable, price at market to fill
+                exit_price = round(competitive_price, 2)
+                self.logger.info(f"Exit accepting small loss: cost=${cost_basis:.2f}, "
+                               f"exit=${exit_price:.2f} (loss=${potential_loss:.2f})")
+            else:
+                # Loss too big - don't chase, set exit at cost minus max tolerance
+                # This order may not fill immediately but limits our loss
+                exit_price = round(cost_basis - max_loss_tolerance, 2)
+                self.logger.info(f"Exit with loss cap: market moved too much. "
+                               f"cost=${cost_basis:.2f}, max_loss=${max_loss_tolerance:.2f}, "
+                               f"exit=${exit_price:.2f} (market ask=${market_ask:.2f})")
 
         exit_price = max(0.02, min(0.98, exit_price))
 
@@ -1636,13 +1641,16 @@ class AvellanedaMarketMaker:
             # DESIRED STATE ENGINE: Reconcile orders instead of cancel-and-replace
             # In dual exit mode, only reconcile the opposite side (don't touch the sell order)
             if exit_status == 'dual_exit' and self.pending_exit:
+                # CRITICAL: Sync tracked orders before reconciling (was missing before!)
+                self._sync_tracked_orders()
+
+                opposite_side = 'no' if self.pending_exit['side'] == 'yes' else 'yes'
+                opposite_price = no_bid if opposite_side == 'no' else yes_bid
+
+                self.logger.info(f"DUAL EXIT MODE: Synced orders, placing {opposite_side.upper()} bid @ ${opposite_price:.2f}")
+
                 # Only reconcile opposite side - the owned side has a SELL order, not a BUY
-                if self.pending_exit['side'] == 'yes':
-                    # Long YES, selling YES, only bid on NO
-                    self._reconcile_side('no', no_bid, 1, int(time.time()) + self.order_expiration, time.time())
-                else:
-                    # Long NO, selling NO, only bid on YES
-                    self._reconcile_side('yes', yes_bid, 1, int(time.time()) + self.order_expiration, time.time())
+                self._reconcile_side(opposite_side, opposite_price, 1, int(time.time()) + self.order_expiration, time.time())
             else:
                 # Normal mode: reconcile both sides
                 self.reconcile_orders(yes_bid, no_bid, desired_count=1, position=q)
