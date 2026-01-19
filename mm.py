@@ -1142,11 +1142,18 @@ class AvellanedaMarketMaker:
         # Sync our tracking with actual API orders
         self._sync_tracked_orders()
 
+        # Log current order state for diagnostics
+        yes_tracked = self.tracked_orders.get('yes')
+        no_tracked = self.tracked_orders.get('no')
+        self.logger.info(f"ORDER STATE: YES={yes_tracked['order_id'][:8] if yes_tracked else 'none'}@${yes_tracked['price']:.2f if yes_tracked else 0}, "
+                        f"NO={no_tracked['order_id'][:8] if no_tracked else 'none'}@${no_tracked['price']:.2f if no_tracked else 0}")
+
         # Process YES side
         if position < position_limit:
             self._reconcile_side('yes', desired_yes_price, desired_count, expiration_ts, current_time)
         else:
             # At position limit - cancel any YES orders
+            self.logger.info(f"POSITION LIMIT: position={position} >= limit={position_limit}, skipping YES orders")
             self._cancel_side_if_exists('yes')
 
         # Process NO side
@@ -1154,6 +1161,7 @@ class AvellanedaMarketMaker:
             self._reconcile_side('no', desired_no_price, desired_count, expiration_ts, current_time)
         else:
             # At position limit - cancel any NO orders
+            self.logger.info(f"POSITION LIMIT: position={position} <= -{position_limit}, skipping NO orders")
             self._cancel_side_if_exists('no')
 
     def _reconcile_side(self, side: str, desired_price: float, desired_count: int,
@@ -1273,23 +1281,15 @@ class AvellanedaMarketMaker:
         Returns True if a new fill was detected that requires tracking.
         """
         if self.last_position is None:
-            # First iteration - record position
+            # First iteration - record position but DON'T auto-trigger exit mode
+            # Existing positions at startup should be managed with normal dual-sided quoting
+            # Exit mode is only for fills that happen DURING the session
             self.last_position = current_position
 
-            # If we're starting with an existing position, set up exit tracking
-            # so we properly manage selling above cost
-            if current_position != 0 and self.pending_exit is None:
+            if current_position != 0:
                 fill_side = 'yes' if current_position > 0 else 'no'
-                # Use bid price as placeholder - actual cost will be fetched from API when exiting
-                entry_price = yes_bid if current_position > 0 else no_bid
-                self.pending_exit = {
-                    'side': fill_side,
-                    'entry_price': entry_price,
-                    'fill_time': time.time(),  # Start timeout from now
-                    'quantity': abs(current_position),
-                }
                 self.logger.info(f"STARTUP: Detected existing {fill_side.upper()} position ({current_position}), "
-                               f"setting up exit tracking (actual cost will be fetched from API)")
+                               f"will manage with dual-sided quoting (not auto-exit mode)")
             return False
 
         position_delta = current_position - self.last_position
@@ -1377,20 +1377,23 @@ class AvellanedaMarketMaker:
         self.last_position = current_position
         return True
 
-    def check_and_place_exit_order(self, current_position: int, yes_mid: float = 0.50) -> str:
+    def check_and_place_exit_order(self, current_position: int, yes_mid: float = 0.50,
+                                      market_yes_bid: float = 0, market_yes_ask: float = 0,
+                                      market_no_bid: float = 0, market_no_ask: float = 0) -> str:
         """Check if we need to place an exit order and do so if timeout exceeded.
 
         DUAL EXIT MODE: After timeout, we run two strategies in parallel:
-        1. Try to SELL the owned side (exit at profit)
+        1. Try to SELL the owned side (exit at market-competitive price)
         2. Continue bidding on opposite side to complete pair trade
 
         If the opposite side fills while we have a sell order out, we've completed
         a pair trade (hold both YES and NO). Cancel all orders and hold to expiry
         for guaranteed spread profit.
 
-        The exit price is calculated as max(cost_basis + 0.01, mid_price) to:
-        1. Always ensure at least 1 cent profit above our actual cost
-        2. Take advantage of favorable market conditions when mid > cost + 1 cent
+        Exit pricing strategy (market-aware):
+        - If we can exit at profit (cost + 1¢ < market ask): price at cost + 1¢
+        - If market moved against us: price at current ask - 1¢ to be competitive
+        - This ensures orders can actually fill rather than sitting above market
 
         Returns:
             'none' - No exit needed or timeout not reached
@@ -1441,19 +1444,45 @@ class AvellanedaMarketMaker:
         else:
             self.logger.info(f"Got actual cost basis from API: ${cost_basis:.2f}")
 
-        # Calculate exit price: max(cost + 1 cent, mid price)
-        min_exit_price = cost_basis + 0.01  # At least 1 cent above cost
+        # Calculate exit price using market-aware strategy
+        # For SELL orders to rest (not immediately execute), they must be > current bid
+        # To be competitive and actually fill, they should be near the current ask
 
         if pending_side == 'yes':
-            mid_for_exit = yes_mid
+            market_bid = market_yes_bid
+            market_ask = market_yes_ask
         else:
-            mid_for_exit = 1 - yes_mid
+            market_bid = market_no_bid
+            market_ask = market_no_ask
 
-        exit_price = round(max(min_exit_price, mid_for_exit), 2)
+        ideal_exit = cost_basis + 0.01  # 1 cent profit
+
+        # Determine competitive price (at or just below current ask)
+        if market_ask > 0:
+            competitive_price = market_ask  # Match current best ask
+        else:
+            competitive_price = 0.99  # Fallback if no ask data
+
+        # Exit pricing logic:
+        # 1. If we can exit at profit AND be competitive: use cost + 1¢
+        # 2. If market moved against us: use competitive price (accept loss to exit)
+        # 3. Never price above 0.98 (leave room for spread)
+
+        if ideal_exit <= competitive_price:
+            # We can get our profit and still be at/below market ask
+            exit_price = round(ideal_exit, 2)
+            self.logger.info(f"Exit at profit: cost=${cost_basis:.2f} + 1¢ = ${exit_price:.2f} "
+                           f"(market ask=${market_ask:.2f})")
+        else:
+            # Market has moved against us - price competitively to actually fill
+            # Use market ask price to be the best offer
+            exit_price = round(competitive_price, 2)
+            potential_loss = cost_basis - exit_price
+            self.logger.info(f"Exit at market: market moved against us. "
+                           f"cost=${cost_basis:.2f}, exit=${exit_price:.2f} "
+                           f"(loss=${potential_loss:.2f})")
+
         exit_price = max(0.02, min(0.98, exit_price))
-
-        self.logger.info(f"Exit price calculation: cost=${cost_basis:.2f}, min_exit=${min_exit_price:.2f}, "
-                        f"mid=${mid_for_exit:.2f}, final=${exit_price:.2f}")
 
         # Store cost basis for pair trade bid calculation
         self.pending_exit['cost_basis'] = cost_basis
@@ -1544,7 +1573,9 @@ class AvellanedaMarketMaker:
             yes_mid = price_data["yes"]
             no_mid = price_data["no"]
             market_yes_bid = price_data["yes_bid"]
+            market_yes_ask = price_data["yes_ask"]
             market_no_bid = price_data["no_bid"]
+            market_no_ask = price_data["no_ask"]
             q = self.api.get_position()
 
             # Compute tick-aware quotes based on market type
@@ -1558,7 +1589,11 @@ class AvellanedaMarketMaker:
             self.detect_fill_and_track(q, yes_bid, no_bid)
 
             # Check if we need to exit (timeout exceeded) or handle dual exit mode
-            exit_status = self.check_and_place_exit_order(q, yes_mid)
+            exit_status = self.check_and_place_exit_order(
+                q, yes_mid,
+                market_yes_bid=market_yes_bid, market_yes_ask=market_yes_ask,
+                market_no_bid=market_no_bid, market_no_ask=market_no_ask
+            )
 
             if exit_status == 'holding':
                 # Pair trade completed - cancel all orders and hold to expiry
@@ -1567,45 +1602,17 @@ class AvellanedaMarketMaker:
                 self.t += dt
                 return
 
-            # Apply cost basis constraint when holding position
-            # In dual exit mode, use stored cost_basis; otherwise get from API
-            min_profit_margin = 0.01 if not self.use_subpenny else 0.005
-
-            if self.pending_exit is not None and q != 0:
-                # Get cost basis - prefer stored value in dual exit mode
-                cost_basis = self.pending_exit.get('cost_basis', 0)
-                if cost_basis <= 0:
-                    try:
-                        position_info = self.api.get_position_with_cost()
-                        if q > 0:
-                            cost_basis = position_info.get('yes_cost', 0)
-                        else:
-                            cost_basis = position_info.get('no_cost', 0)
-                    except Exception as e:
-                        self.logger.warning(f"Could not get cost basis for constraint check: {e}")
-                        cost_basis = self.pending_exit.get('entry_price', 0)
-
-                if cost_basis > 0:
-                    if q > 0:  # Long YES, constraining NO bid
-                        max_no_bid = 1.00 - cost_basis - min_profit_margin
-                        if self.use_subpenny:
-                            max_no_bid = round(max_no_bid * 200) / 200
-                        else:
-                            max_no_bid = round(max_no_bid, 2)
-                        if no_bid > max_no_bid:
-                            self.logger.info(f"COST BASIS CONSTRAINT: NO bid ${no_bid:.3f} exceeds "
-                                           f"max ${max_no_bid:.3f} (YES cost=${cost_basis:.3f}), capping")
-                            no_bid = max(0.02, max_no_bid)
-                    elif q < 0:  # Long NO, constraining YES bid
-                        max_yes_bid = 1.00 - cost_basis - min_profit_margin
-                        if self.use_subpenny:
-                            max_yes_bid = round(max_yes_bid * 200) / 200
-                        else:
-                            max_yes_bid = round(max_yes_bid, 2)
-                        if yes_bid > max_yes_bid:
-                            self.logger.info(f"COST BASIS CONSTRAINT: YES bid ${yes_bid:.3f} exceeds "
-                                           f"max ${max_yes_bid:.3f} (NO cost=${cost_basis:.3f}), capping")
-                            yes_bid = max(0.02, max_yes_bid)
+            # Cost basis constraint REMOVED - it was too restrictive and preventing orders
+            # The constraint would cap opposite-side bids to guarantee profit, but this meant:
+            # - If cost basis is 0.55, max NO bid would be 0.44 (1.00 - 0.55 - 0.01)
+            # - If NO market is at 0.48, our 0.44 bid would never fill
+            # - Result: no orders placed, no liquidity provided, no chance to exit
+            #
+            # Better approach: Let the market maker provide liquidity at market prices.
+            # If we complete a pair trade at a small loss, that's better than being stuck.
+            # The tick-aware pricing and flip_skew already handle inventory management.
+            if q != 0:
+                self.logger.debug(f"Position: {q}, continuing with market-based pricing (no cost constraint)")
 
             # Log market state
             if self.use_subpenny:
