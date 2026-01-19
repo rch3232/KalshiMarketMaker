@@ -315,21 +315,54 @@ class KalshiTradingAPI(AbstractTradingAPI):
             # Convert to decimal (0-1 scale)
             yes_bid = float(yes_bid_raw) / 100
             yes_ask = float(yes_ask_raw) / 100
+            no_bid = float(no_bid_raw) / 100
+            no_ask = float(no_ask_raw) / 100
 
-            # Calculate mid-price with fallback handling for illiquid markets
+            # Calculate implied YES prices from NO side (for cross-validation)
+            # In Kalshi: YES_price + NO_price ≈ $1
+            # So: YES_bid ≈ 1 - NO_ask and YES_ask ≈ 1 - NO_bid
+            implied_yes_bid = round(1 - no_ask, 2) if no_ask > 0 else 0
+            implied_yes_ask = round(1 - no_bid, 2) if no_bid > 0 else 0
+
+            # Calculate mid-price with improved fallback logic
             if yes_bid > 0 and yes_ask > 0:
                 # Normal case: both bid and ask exist
                 yes_mid_price = round((yes_bid + yes_ask) / 2, 2)
-            elif yes_ask > 0:
-                # Only ask exists (no bids) - use ask with buffer
-                yes_mid_price = round(yes_ask - 0.05, 2)
-                self.logger.warning(f"No YES bids, using ask-based mid: ${yes_mid_price:.2f}")
-            elif yes_bid > 0:
-                # Only bid exists (no asks) - use bid with buffer
-                yes_mid_price = round(yes_bid + 0.05, 2)
-                self.logger.warning(f"No YES asks, using bid-based mid: ${yes_mid_price:.2f}")
+            elif yes_bid > 0 or yes_ask > 0:
+                # One-sided YES book - use available data plus NO-side cross-validation
+                if yes_bid > 0 and implied_yes_ask > 0:
+                    # Have YES bid and implied ask from NO side
+                    yes_mid_price = round((yes_bid + implied_yes_ask) / 2, 2)
+                    self.logger.warning(f"No YES asks, using NO-implied mid: ${yes_mid_price:.2f}")
+                elif yes_ask > 0 and implied_yes_bid > 0:
+                    # Have YES ask and implied bid from NO side
+                    yes_mid_price = round((implied_yes_bid + yes_ask) / 2, 2)
+                    self.logger.warning(f"No YES bids, using NO-implied mid: ${yes_mid_price:.2f}")
+                elif yes_ask > 0:
+                    # Only YES ask exists - use proportional buffer (10% of price)
+                    buffer = max(0.01, yes_ask * 0.10)
+                    yes_mid_price = round(yes_ask - buffer, 2)
+                    self.logger.warning(f"No YES bids or NO data, using ask-based mid: ${yes_mid_price:.2f}")
+                else:
+                    # Only YES bid exists - use proportional buffer (10% of remaining)
+                    buffer = max(0.01, (1 - yes_bid) * 0.10)
+                    yes_mid_price = round(yes_bid + buffer, 2)
+                    self.logger.warning(f"No YES asks or NO data, using bid-based mid: ${yes_mid_price:.2f}")
+            elif implied_yes_bid > 0 or implied_yes_ask > 0:
+                # No YES data but have NO data - derive from NO side
+                if implied_yes_bid > 0 and implied_yes_ask > 0:
+                    yes_mid_price = round((implied_yes_bid + implied_yes_ask) / 2, 2)
+                    self.logger.warning(f"No YES data, using NO-derived mid: ${yes_mid_price:.2f}")
+                elif implied_yes_bid > 0:
+                    buffer = max(0.01, (1 - implied_yes_bid) * 0.10)
+                    yes_mid_price = round(implied_yes_bid + buffer, 2)
+                    self.logger.warning(f"Only NO ask exists, using derived mid: ${yes_mid_price:.2f}")
+                else:
+                    buffer = max(0.01, implied_yes_ask * 0.10)
+                    yes_mid_price = round(implied_yes_ask - buffer, 2)
+                    self.logger.warning(f"Only NO bid exists, using derived mid: ${yes_mid_price:.2f}")
             else:
-                # No bid or ask - try last_price or default to 0.50
+                # No bid or ask on either side - try last_price or default to 0.50
                 last_price = market.get("last_price", 0) or 0
                 if last_price > 0:
                     yes_mid_price = round(float(last_price) / 100, 2)
@@ -338,8 +371,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
                     yes_mid_price = 0.50
                     self.logger.warning(f"No market data available, defaulting to ${yes_mid_price:.2f}")
 
-            # Ensure mid-price is within valid bounds
-            yes_mid_price = max(0.05, min(0.95, yes_mid_price))
+            # Ensure mid-price is within valid bounds (expanded to allow near-boundary pricing)
+            yes_mid_price = max(0.01, min(0.99, yes_mid_price))
             no_mid_price = round(1 - yes_mid_price, 2)
 
             self.logger.info(f"Market mid-prices: YES=${yes_mid_price:.2f}, NO=${no_mid_price:.2f}")
