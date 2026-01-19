@@ -34,8 +34,8 @@ category: Sports
 # =============================================================================
 
 # How often to check for new markets (in seconds)
-# New games appear throughout the day, so check every 5 minutes
-refresh_interval: 300
+# Check every 2 minutes to pick up new games quickly
+refresh_interval: 120
 
 # How long each market maker runs before recycling (in seconds)
 # Set to 1 hour - markets will be re-evaluated and restarted if still active
@@ -49,7 +49,7 @@ dt: 2.0
 
 # Maximum number of markets to trade simultaneously
 # Higher value allows managing positions while still discovering new markets
-max_concurrent_markets: 20
+max_concurrent_markets: 30
 
 # =============================================================================
 # LIQUIDITY FILTER
@@ -58,13 +58,13 @@ max_concurrent_markets: 20
 
 liquidity_filter:
   # Minimum 24h volume required (0 = disabled)
-  # 20000 contracts ≈ $20,000 volume (at $1 settlement value per contract)
-  min_volume: 20000
+  # Set to 0 to allow new markets that don't have volume yet
+  min_volume: 0
 
   # Maximum bid-ask spread in cents
   # Markets with spreads wider than this are skipped (likely illiquid)
-  # 8 = skip if spread > 8¢ (tight filter for liquid markets only)
-  max_spread_cents: 8
+  # 15 = skip if spread > 15¢ (allows new markets with moderate spreads)
+  max_spread_cents: 15
 
 # =============================================================================
 # LONG SHOT BIAS FILTER
@@ -94,7 +94,7 @@ liquidity_incentives:
   # Enable fetching and prioritizing incentive markets
   enabled: true
 
-  # Incentive markets are checked every 30 minutes (hardcoded)
+  # Incentive markets are checked every 5 minutes (synced with refresh_interval)
   # They get priority in the market queue and bypass longshot_filter
 
 # =============================================================================

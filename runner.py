@@ -125,7 +125,7 @@ _incentive_cache = {
 }
 _incentive_cache_lock = None  # Will be initialized on first use
 
-INCENTIVE_REFRESH_INTERVAL = 1800  # 30 minutes in seconds
+INCENTIVE_REFRESH_INTERVAL = 300  # 5 minutes in seconds (faster pickup of new incentive markets)
 
 
 def get_incentive_tickers(api_key: str, private_key: str, base_url: str,

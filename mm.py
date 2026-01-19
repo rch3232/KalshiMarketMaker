@@ -901,29 +901,33 @@ class KalshiTradingAPI(AbstractTradingAPI):
     def get_incentive_programs(self) -> List[Dict]:
         """Get all active liquidity incentive programs.
 
-        Fetches from /v2/incentive_programs and filters for liquidity_incentive type.
+        Fetches from /incentive_programs with status=active and type=liquidity filters.
         These markets pay for having resting orders within 2 cents of strike.
 
         Returns:
             List of incentive program dictionaries containing:
-            - market_tickers: List of market tickers eligible for the incentive
-            - type: "liquidity_incentive" for liquidity rewards
+            - market_ticker: Single market ticker eligible for the incentive
+            - series_ticker: Series ticker (all markets in this series are eligible)
+            - incentive_type: "liquidity" for liquidity rewards
             - Other program metadata (rates, requirements, etc.)
         """
         self.logger.info("Fetching active liquidity incentive programs...")
         try:
-            response = self._make_request("GET", "/incentive_programs")
+            # Use status=active and type=liquidity filters for efficiency
+            response = self._make_request("GET", "/incentive_programs?status=active&type=liquidity")
             programs = response.get("programs", []) or response.get("incentive_programs", [])
 
-            # Filter for liquidity incentive programs only
-            liquidity_programs = [
-                p for p in programs
-                if p.get('type') == 'liquidity_incentive' or p.get('program_type') == 'liquidity_incentive'
-            ]
+            # Log all programs for debugging
+            if programs:
+                self.logger.info(f"Fetched {len(programs)} active liquidity programs")
+                # Log first program's keys to help debug field names
+                if programs:
+                    sample = programs[0]
+                    self.logger.debug(f"Sample program fields: {list(sample.keys())}")
+            else:
+                self.logger.info("No active liquidity incentive programs found")
 
-            self.logger.info(f"Found {len(liquidity_programs)} liquidity incentive programs "
-                           f"(out of {len(programs)} total programs)")
-            return liquidity_programs
+            return programs
 
         except Exception as e:
             self.logger.error(f"Failed to fetch incentive programs: {e}")
@@ -932,26 +936,47 @@ class KalshiTradingAPI(AbstractTradingAPI):
     def get_incentive_market_tickers(self) -> Set[str]:
         """Get set of all market tickers that have active liquidity incentives.
 
-        Returns:
-            Set of market ticker strings that are eligible for liquidity incentives
+        Returns a tuple of:
+        - Set of specific market tickers with incentives
+        - Set of series tickers with incentives (for matching all markets in series)
         """
         programs = self.get_incentive_programs()
         incentive_tickers = set()
+        incentive_series = set()
 
         for program in programs:
-            # Try different field names that might contain tickers
+            # Check for specific market ticker (singular - per API docs)
+            market_ticker = program.get('market_ticker') or program.get('ticker')
+            if market_ticker:
+                incentive_tickers.add(market_ticker)
+                self.logger.debug(f"Incentive market ticker: {market_ticker}")
+
+            # Check for series ticker (matches ALL markets in the series)
+            series_ticker = program.get('series_ticker')
+            if series_ticker:
+                incentive_series.add(series_ticker)
+                self.logger.debug(f"Incentive series ticker: {series_ticker}")
+
+            # Also check plural forms in case API changes
             tickers = program.get('market_tickers', []) or program.get('tickers', [])
             if isinstance(tickers, list):
                 incentive_tickers.update(tickers)
             elif isinstance(tickers, str):
                 incentive_tickers.add(tickers)
 
-            # Also check for single ticker field
-            single_ticker = program.get('market_ticker') or program.get('ticker')
-            if single_ticker:
-                incentive_tickers.add(single_ticker)
+        # If we have series tickers, fetch all markets in those series
+        if incentive_series:
+            self.logger.info(f"Found {len(incentive_series)} series with incentives: {incentive_series}")
+            for series in incentive_series:
+                try:
+                    markets = self.get_active_markets_by_series(series)
+                    series_market_tickers = {m.get('ticker') for m in markets if m.get('ticker')}
+                    self.logger.info(f"Series {series} has {len(series_market_tickers)} markets with incentives")
+                    incentive_tickers.update(series_market_tickers)
+                except Exception as e:
+                    self.logger.warning(f"Failed to fetch markets for incentive series {series}: {e}")
 
-        self.logger.info(f"Found {len(incentive_tickers)} markets with liquidity incentives")
+        self.logger.info(f"Found {len(incentive_tickers)} total markets with liquidity incentives")
         return incentive_tickers
 
 
