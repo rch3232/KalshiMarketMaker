@@ -98,7 +98,7 @@ liquidity_incentives:
   # They get priority in the market queue with special filter handling:
   # - Volume check: APPLIED (must still meet min_volume requirement)
   # - Spread/order book check: BYPASSED (trade even with wide spreads)
-  # - Long shot filter: BYPASSED (trade at any price level)
+  # - Long shot filter: APPLIED (20-80 cent range enforced)
 
   # Position limits for incentive markets (overrides market_maker.max_position)
   max_position: 15             # Max contracts per side for incentive markets

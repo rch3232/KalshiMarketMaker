@@ -586,10 +586,8 @@ def fetch_active_markets_by_category(
                     skipped_liquidity += 1
                     continue
 
-            # Apply long shot bias filter ONLY if:
-            # 1. Filter is enabled
-            # 2. Market does NOT have liquidity incentives (incentive markets bypass this filter)
-            if longshot_filter_enabled and not has_incentive:
+            # Apply long shot bias filter (20-80 cent range) to all markets including incentive markets
+            if longshot_filter_enabled:
                 is_safe, longshot_reason = check_longshot_bias(
                     market, longshot_price_floor, longshot_price_ceiling
                 )
