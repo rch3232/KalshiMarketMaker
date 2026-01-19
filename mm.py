@@ -501,6 +501,123 @@ class KalshiTradingAPI(AbstractTradingAPI):
             self.logger.error(f"Failed to get orders: {e}")
             raise
 
+    def get_market_info(self) -> Dict:
+        """Get market metadata including min_tick_size.
+
+        Returns a dict with:
+        - min_tick_size: float (e.g., 0.01 for 1 cent, 0.005 for half-cent markets)
+        - ticker: str
+        - status: str
+        - Other market metadata
+        """
+        self.logger.info("Retrieving market info...")
+        try:
+            response = self._make_request("GET", f"/markets/{self.market_ticker}")
+            market = response.get("market", {})
+
+            # min_tick_size is returned as cents in the API, convert to dollars
+            # e.g., 1 (cent) -> 0.01, 0.5 (half cent) -> 0.005
+            tick_cents = market.get("tick_size", 1) or 1
+            min_tick_size = tick_cents / 100.0
+
+            result = {
+                "min_tick_size": min_tick_size,
+                "ticker": market.get("ticker", self.market_ticker),
+                "status": market.get("status", "unknown"),
+                "title": market.get("title", ""),
+            }
+            self.logger.info(f"Market info: tick_size=${min_tick_size:.4f} ({tick_cents}¢)")
+            return result
+        except Exception as e:
+            self.logger.error(f"Failed to get market info: {e}")
+            raise
+
+    def decrease_order(self, order_id: str, reduce_by: int) -> bool:
+        """Decrease an order's quantity without losing queue priority.
+
+        Uses POST /portfolio/orders/{order_id}/decrease to reduce order size
+        while maintaining time priority in the order book.
+
+        Args:
+            order_id: The order ID to decrease
+            reduce_by: Number of contracts to reduce by
+
+        Returns:
+            True if successful, False otherwise
+        """
+        self.logger.info(f"Decreasing order {order_id} by {reduce_by} contracts...")
+        try:
+            data = {"reduce_by": reduce_by}
+            response = self._make_request("POST", f"/portfolio/orders/{order_id}/decrease", data)
+            reduced = response.get("order", {}).get("remaining_count", 0)
+            self.logger.info(f"Order {order_id} decreased, remaining: {reduced}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to decrease order {order_id}: {e}")
+            return False
+
+    def place_order_subpenny(
+        self,
+        action: str,
+        side: str,
+        price: float,
+        quantity: int,
+        expiration_ts: int = None,
+        use_dollars: bool = False
+    ) -> str:
+        """Place an order with sub-penny support using yes_price_dollars/no_price_dollars.
+
+        For markets with min_tick_size < 0.01 (e.g., 0.005 for half-cent markets),
+        use yes_price_dollars/no_price_dollars as strings for precise pricing.
+
+        Args:
+            action: 'buy' or 'sell'
+            side: 'yes' or 'no'
+            price: Price in dollars (e.g., 0.455 for 45.5 cents)
+            quantity: Number of contracts
+            expiration_ts: Optional expiration timestamp
+            use_dollars: If True, use *_price_dollars fields for sub-penny precision
+
+        Returns:
+            Order ID as string
+        """
+        price_str = f"{price:.3f}"
+        self.logger.info(f"Placing {action} order for {side} side at ${price_str} with quantity {quantity}...")
+        try:
+            order_data = {
+                "ticker": self.market_ticker,
+                "action": action.lower(),
+                "type": "limit",
+                "side": side,
+                "count": quantity,
+                "client_order_id": str(uuid.uuid4()),
+            }
+
+            if use_dollars:
+                # Use *_price_dollars for sub-penny precision (string format)
+                if side == "yes":
+                    order_data["yes_price_dollars"] = price_str
+                else:
+                    order_data["no_price_dollars"] = price_str
+            else:
+                # Standard integer cents pricing
+                price_cents = int(round(price * 100))
+                if side == "yes":
+                    order_data["yes_price"] = price_cents
+                else:
+                    order_data["no_price"] = price_cents
+
+            if expiration_ts is not None:
+                order_data["expiration_ts"] = expiration_ts
+
+            response = self._make_request("POST", "/portfolio/orders", order_data)
+            order_id = response.get("order", {}).get("order_id")
+            self.logger.info(f"Placed {action} order, order ID: {order_id}")
+            return str(order_id)
+        except Exception as e:
+            self.logger.error(f"Failed to place order: {e}")
+            raise
+
     def get_active_markets_by_series(self, series_ticker: str) -> List[Dict]:
         """Get all open markets for a series."""
         self.logger.info(f"Fetching markets for series: {series_ticker}")
@@ -568,19 +685,23 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
 
 class AvellanedaMarketMaker:
-    """Market maker using Avellaneda-Stoikov strategy with Dual-Quote flipping.
+    """Market maker using Avellaneda-Stoikov strategy with Desired State Engine.
 
     This implementation is calibrated for binary probability markets (0.00 to 1.00 scale)
     and uses a dual-quote strategy that places BUY orders on both YES and NO sides
     to capture spread from whichever direction the market moves.
 
     Key features:
+    - Desired State Engine: Reconciles orders instead of cancel-and-replace
+    - Sub-penny support: Uses yes_price_dollars for half-cent markets
+    - Queue priority preservation: Uses decrease endpoint, 10s MIN_AGE filter
+    - Tick-aware pricing: 2¢ spread for 1¢ ticks, 1¢ spread for 0.5¢ ticks
     - Decimal-scale aligned parameters (gamma scaled to 0.01-0.05 range)
-    - Simultaneous YES/NO bidding to capture spread from either direction
-    - Asymmetric inventory urgency for aggressive position flipping
-    - Hard adaptive caps to prevent quotes from getting stuck at boundaries
     - Auto-exit: if one side fills but opposite doesn't within timeout, exits at small profit
     """
+
+    # Minimum order age before modification (preserve queue priority)
+    MIN_ORDER_AGE = 10.0  # seconds
 
     def __init__(
         self,
@@ -592,7 +713,7 @@ class AvellanedaMarketMaker:
         T: float = 3600,               # Time horizon in seconds
         max_position: int = 5,         # Max contracts per side
         order_expiration: int = 300,   # Order TTL in seconds
-        min_spread: float = 0.02,      # Minimum spread ($0.02)
+        min_spread: float = 0.02,      # Minimum spread ($0.02) - for 1¢ tick markets
         max_spread: float = 0.10,      # Maximum spread ($0.10)
         position_limit_buffer: float = 0.1,
         flip_skew_factor: float = 0.03,  # Aggressive skew for inventory flipping
@@ -617,6 +738,14 @@ class AvellanedaMarketMaker:
         self.t = 0
         self.active_yes_order_id = None
         self.active_no_order_id = None
+
+        # Market tick size tracking (fetched once at startup)
+        self.min_tick_size = None  # Will be set on first iteration
+        self.use_subpenny = False  # True if min_tick_size < 0.01
+
+        # Order tracking for Desired State Engine
+        # Format: {'order_id': str, 'price': float, 'side': str, 'created_at': float, 'count': int}
+        self.tracked_orders = {}  # keyed by side ('yes' or 'no')
 
         # Fill tracking for auto-exit feature
         # Tracks the last known position to detect fills
@@ -796,6 +925,297 @@ class AvellanedaMarketMaker:
         no_bid = max(0.02, min(0.98, no_bid))
 
         return yes_bid, no_bid
+
+    def _fetch_tick_size(self) -> None:
+        """Fetch and cache the market's min_tick_size on first iteration."""
+        if self.min_tick_size is not None:
+            return  # Already fetched
+
+        try:
+            market_info = self.api.get_market_info()
+            self.min_tick_size = market_info.get("min_tick_size", 0.01)
+            self.use_subpenny = self.min_tick_size < 0.01
+
+            if self.use_subpenny:
+                self.logger.info(f"SUB-PENNY MARKET: tick_size=${self.min_tick_size:.4f}, "
+                               f"using 1¢ spread with half-cent precision")
+            else:
+                self.logger.info(f"STANDARD MARKET: tick_size=${self.min_tick_size:.4f}, "
+                               f"using 2¢ spread")
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch tick size, defaulting to 1¢: {e}")
+            self.min_tick_size = 0.01
+            self.use_subpenny = False
+
+    def compute_tick_aware_quotes(self, yes_mid: float, q: int, t: float,
+                                   market_yes_bid: float = 0, market_no_bid: float = 0) -> Tuple[float, float]:
+        """Compute bid prices based on market tick size.
+
+        Pricing Strategy:
+        - If min_tick_size is 0.01 (1 cent): Set bid 1 penny below mid (2 cent spread)
+        - If min_tick_size < 0.01 (half cent): Set bid 0.5 cents below mid (1 cent spread)
+
+        Returns:
+            Tuple of (yes_bid_price, no_bid_price)
+        """
+        no_mid = 1 - yes_mid
+
+        if self.use_subpenny:
+            # Half-cent market: bid 0.5¢ below mid for 1¢ spread
+            half_spread = 0.005  # $0.005 = 0.5 cents
+
+            # Round to nearest half-cent
+            yes_bid = round((yes_mid - half_spread) * 200) / 200  # Round to 0.005
+            no_bid = round((no_mid - half_spread) * 200) / 200
+
+            self.logger.debug(f"Sub-penny quotes: YES mid=${yes_mid:.3f} -> bid=${yes_bid:.3f}, "
+                            f"NO mid=${no_mid:.3f} -> bid=${no_bid:.3f}")
+        else:
+            # Standard 1-cent market: bid 1¢ below mid for 2¢ spread
+            half_spread = 0.01  # $0.01 = 1 cent
+
+            # Round to nearest cent
+            yes_bid = round(yes_mid - half_spread, 2)
+            no_bid = round(no_mid - half_spread, 2)
+
+            self.logger.debug(f"Standard quotes: YES mid=${yes_mid:.2f} -> bid=${yes_bid:.2f}, "
+                            f"NO mid=${no_mid:.2f} -> bid=${no_bid:.2f}")
+
+        # Apply inventory skew for position management
+        if q != 0:
+            flip_adj = abs(q) * self.flip_skew_factor
+            if q > 0:
+                # Long YES: make NO bid more aggressive
+                no_bid = no_bid + flip_adj
+                yes_bid = yes_bid - flip_adj
+            else:
+                # Long NO: make YES bid more aggressive
+                yes_bid = yes_bid + flip_adj
+                no_bid = no_bid - flip_adj
+
+            # Re-round after adjustment
+            if self.use_subpenny:
+                yes_bid = round(yes_bid * 200) / 200
+                no_bid = round(no_bid * 200) / 200
+            else:
+                yes_bid = round(yes_bid, 2)
+                no_bid = round(no_bid, 2)
+
+        # Ensure we're at least at market bid (competitive pricing)
+        if market_yes_bid > 0 and yes_bid < market_yes_bid:
+            self.logger.info(f"YES bid ${yes_bid:.3f} below market ${market_yes_bid:.3f}, raising")
+            yes_bid = market_yes_bid
+
+        if market_no_bid > 0 and no_bid < market_no_bid:
+            self.logger.info(f"NO bid ${no_bid:.3f} below market ${market_no_bid:.3f}, raising")
+            no_bid = market_no_bid
+
+        # Final clamp
+        yes_bid = max(0.02, min(0.98, yes_bid))
+        no_bid = max(0.02, min(0.98, no_bid))
+
+        return yes_bid, no_bid
+
+    def _price_matches(self, price1: float, price2: float) -> bool:
+        """Check if two prices match within tick tolerance."""
+        tolerance = self.min_tick_size if self.min_tick_size else 0.01
+        return abs(price1 - price2) < tolerance / 2
+
+    def _sync_tracked_orders(self) -> None:
+        """Sync local order tracking with actual orders from API.
+
+        Updates self.tracked_orders to reflect current resting orders.
+        """
+        try:
+            api_orders = self.api.get_orders()
+            current_time = time.time()
+
+            # Build a map of current orders by side
+            api_orders_by_side = {'yes': None, 'no': None}
+            for order in api_orders:
+                side = order.get('side', '')
+                if side in ('yes', 'no') and order.get('action') == 'buy':
+                    # Get price - check both cents and dollars formats
+                    if side == 'yes':
+                        price = order.get('yes_price', 0) / 100.0
+                        if 'yes_price_dollars' in order:
+                            price = float(order['yes_price_dollars'])
+                    else:
+                        price = order.get('no_price', 0) / 100.0
+                        if 'no_price_dollars' in order:
+                            price = float(order['no_price_dollars'])
+
+                    api_orders_by_side[side] = {
+                        'order_id': order.get('order_id'),
+                        'price': price,
+                        'side': side,
+                        'count': order.get('remaining_count', 1),
+                        'created_at': order.get('created_time', current_time),
+                    }
+
+            # Update tracked orders
+            for side in ('yes', 'no'):
+                api_order = api_orders_by_side[side]
+                tracked = self.tracked_orders.get(side)
+
+                if api_order is None:
+                    # Order no longer exists
+                    if tracked:
+                        self.logger.debug(f"Order for {side} side no longer exists, clearing tracking")
+                    self.tracked_orders[side] = None
+                elif tracked is None or tracked['order_id'] != api_order['order_id']:
+                    # New order or different order - update tracking
+                    # Parse created_time if it's a string
+                    created_at = api_order['created_at']
+                    if isinstance(created_at, str):
+                        try:
+                            from datetime import datetime
+                            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                            created_at = dt.timestamp()
+                        except:
+                            created_at = current_time
+                    self.tracked_orders[side] = {
+                        'order_id': api_order['order_id'],
+                        'price': api_order['price'],
+                        'side': side,
+                        'count': api_order['count'],
+                        'created_at': created_at,
+                    }
+                else:
+                    # Same order - update count (may have partially filled)
+                    tracked['count'] = api_order['count']
+
+        except Exception as e:
+            self.logger.warning(f"Failed to sync tracked orders: {e}")
+
+    def reconcile_orders(self, desired_yes_price: float, desired_no_price: float,
+                         desired_count: int = 1, position: int = 0) -> None:
+        """Reconcile current orders with desired state (Desired State Engine).
+
+        This is the core of the Desired State Engine:
+        1. Compare desired price to active orders
+        2. If price matches: Do NOT cancel (preserve queue priority)
+           - If count is too high, use decrease endpoint
+        3. If price is different AND order age > MIN_AGE: Cancel and replace
+        4. If price is different AND order age < MIN_AGE: Wait (don't jump out of line)
+
+        Args:
+            desired_yes_price: Target YES bid price
+            desired_no_price: Target NO bid price
+            desired_count: Desired order quantity (default 1)
+            position: Current inventory position
+        """
+        current_time = time.time()
+        position_limit = int(self.max_position * (1 - self.position_limit_buffer))
+        expiration_ts = int(current_time) + self.order_expiration
+
+        # Sync our tracking with actual API orders
+        self._sync_tracked_orders()
+
+        # Process YES side
+        if position < position_limit:
+            self._reconcile_side('yes', desired_yes_price, desired_count, expiration_ts, current_time)
+        else:
+            # At position limit - cancel any YES orders
+            self._cancel_side_if_exists('yes')
+
+        # Process NO side
+        if position > -position_limit:
+            self._reconcile_side('no', desired_no_price, desired_count, expiration_ts, current_time)
+        else:
+            # At position limit - cancel any NO orders
+            self._cancel_side_if_exists('no')
+
+    def _reconcile_side(self, side: str, desired_price: float, desired_count: int,
+                        expiration_ts: int, current_time: float) -> None:
+        """Reconcile orders for a single side (YES or NO).
+
+        Args:
+            side: 'yes' or 'no'
+            desired_price: Target price for this side
+            desired_count: Desired quantity
+            expiration_ts: Order expiration timestamp
+            current_time: Current time for age calculations
+        """
+        tracked = self.tracked_orders.get(side)
+
+        if tracked is None:
+            # No existing order - place new one
+            self.logger.info(f"No existing {side.upper()} order, placing at ${desired_price:.3f}")
+            self._place_order(side, desired_price, desired_count, expiration_ts)
+            return
+
+        # Check if price matches
+        if self._price_matches(tracked['price'], desired_price):
+            # Price matches - preserve queue priority
+            self.logger.debug(f"{side.upper()} order at ${tracked['price']:.3f} matches desired, keeping")
+
+            # Check if we need to decrease quantity
+            if tracked['count'] > desired_count:
+                reduce_by = tracked['count'] - desired_count
+                self.logger.info(f"{side.upper()} order has {tracked['count']} contracts, "
+                               f"reducing by {reduce_by} to {desired_count}")
+                self.api.decrease_order(tracked['order_id'], reduce_by)
+            return
+
+        # Price doesn't match - check order age
+        order_age = current_time - tracked['created_at']
+        if order_age < self.MIN_ORDER_AGE:
+            # Order too young - don't cancel yet (preserve queue priority)
+            remaining = self.MIN_ORDER_AGE - order_age
+            self.logger.info(f"{side.upper()} order age {order_age:.1f}s < {self.MIN_ORDER_AGE}s MIN_AGE, "
+                           f"waiting {remaining:.1f}s before repricing "
+                           f"(current: ${tracked['price']:.3f}, desired: ${desired_price:.3f})")
+            return
+
+        # Order is old enough and price changed - cancel and replace
+        self.logger.info(f"{side.upper()} price changed: ${tracked['price']:.3f} -> ${desired_price:.3f} "
+                        f"(age: {order_age:.1f}s), canceling and replacing")
+        try:
+            self.api.cancel_order(tracked['order_id'])
+        except Exception as e:
+            self.logger.warning(f"Failed to cancel {side} order: {e}")
+
+        self._place_order(side, desired_price, desired_count, expiration_ts)
+
+    def _place_order(self, side: str, price: float, count: int, expiration_ts: int) -> None:
+        """Place an order and track it locally."""
+        try:
+            if self.use_subpenny:
+                order_id = self.api.place_order_subpenny(
+                    "buy", side, price, count, expiration_ts, use_dollars=True
+                )
+            else:
+                order_id = self.api.place_order("buy", side, price, count, expiration_ts)
+
+            # Track the new order locally
+            self.tracked_orders[side] = {
+                'order_id': order_id,
+                'price': price,
+                'side': side,
+                'count': count,
+                'created_at': time.time(),
+            }
+
+            # Update legacy tracking
+            if side == 'yes':
+                self.active_yes_order_id = order_id
+            else:
+                self.active_no_order_id = order_id
+
+        except Exception as e:
+            self.logger.error(f"Failed to place {side} order at ${price:.3f}: {e}")
+
+    def _cancel_side_if_exists(self, side: str) -> None:
+        """Cancel an order for a side if it exists."""
+        tracked = self.tracked_orders.get(side)
+        if tracked:
+            try:
+                self.api.cancel_order(tracked['order_id'])
+                self.tracked_orders[side] = None
+                self.logger.info(f"Canceled {side.upper()} order (at position limit)")
+            except Exception as e:
+                self.logger.warning(f"Failed to cancel {side} order: {e}")
 
     def detect_fill_and_track(self, current_position: int, yes_bid: float, no_bid: float) -> bool:
         """Detect if a fill occurred and track it for potential auto-exit.
@@ -998,33 +1418,38 @@ class AvellanedaMarketMaker:
             self.logger.error(f"Failed to get orders for cancellation: {e}")
 
     def run_iteration(self, dt: float):
-        """Run one iteration of the market making loop.
+        """Run one iteration of the market making loop (Desired State Engine).
 
         Each iteration:
-        1. Fetches current market prices
-        2. Gets current inventory position
-        3. Detects fills and tracks them for auto-exit
-        4. If in exit mode (timeout exceeded), places exit order and skips normal quoting
-        5. Otherwise, cancels all orders and places fresh dual quotes
+        1. Fetches market tick size (once) to determine pricing precision
+        2. Fetches current market prices and inventory
+        3. Computes tick-aware quotes based on market type:
+           - 1¢ tick markets: 2¢ spread (bid 1¢ below mid)
+           - 0.5¢ tick markets: 1¢ spread (bid 0.5¢ below mid)
+        4. Reconciles orders instead of cancel-and-replace:
+           - If price matches: Keep order (preserve queue priority)
+           - If count too high: Use decrease endpoint
+           - If price changed AND age > 10s: Cancel and replace
+           - If price changed AND age < 10s: Wait (don't jump out of line)
+        5. Auto-exit logic for one-sided fills
         """
         try:
+            # Fetch tick size once on first iteration
+            self._fetch_tick_size()
+
             # Get current market state
             price_data = self.api.get_price()
             yes_mid = price_data["yes"]
             no_mid = price_data["no"]
             market_yes_bid = price_data["yes_bid"]
-            market_yes_ask = price_data["yes_ask"]
             market_no_bid = price_data["no_bid"]
-            market_no_ask = price_data["no_ask"]
             q = self.api.get_position()
 
-            # Compute dual quotes (needed for fill detection even if not placing orders)
-            yes_bid, no_bid = self.compute_dual_quotes(
+            # Compute tick-aware quotes based on market type
+            yes_bid, no_bid = self.compute_tick_aware_quotes(
                 yes_mid, q, self.t,
                 market_yes_bid=market_yes_bid,
-                market_yes_ask=market_yes_ask,
                 market_no_bid=market_no_bid,
-                market_no_ask=market_no_ask,
             )
 
             # Detect fills and track for auto-exit
@@ -1033,16 +1458,12 @@ class AvellanedaMarketMaker:
             # Check if we need to exit (timeout exceeded)
             if self.check_and_place_exit_order(q, yes_mid):
                 # Exit order placed - skip normal market making this iteration
-                # We'll continue normal operation once position is flat
                 self.logger.info("In exit mode - waiting for exit order to fill")
                 self.t += dt
                 return
 
-            # CRITICAL FIX: When we have a position, constrain opposite-side bid
-            # to ensure flattening trades are profitable, not loss-making.
-            # If we own NO at cost $X, buying YES at price > (1.00 - X) loses money.
-            # If we own YES at cost $X, buying NO at price > (1.00 - X) loses money.
-            min_profit_margin = 0.01  # Require at least 1 cent profit on flattening
+            # Apply cost basis constraint when holding position
+            min_profit_margin = 0.01 if not self.use_subpenny else 0.005
 
             if self.pending_exit is not None and q != 0:
                 try:
@@ -1050,52 +1471,41 @@ class AvellanedaMarketMaker:
                     if q > 0:  # Long YES, constraining NO bid
                         yes_cost = position_info.get('yes_cost', 0)
                         if yes_cost > 0:
-                            max_no_bid = round(1.00 - yes_cost - min_profit_margin, 2)
+                            max_no_bid = 1.00 - yes_cost - min_profit_margin
+                            if self.use_subpenny:
+                                max_no_bid = round(max_no_bid * 200) / 200
+                            else:
+                                max_no_bid = round(max_no_bid, 2)
                             if no_bid > max_no_bid:
-                                self.logger.info(f"COST BASIS CONSTRAINT: NO bid ${no_bid:.2f} exceeds "
-                                               f"max ${max_no_bid:.2f} (YES cost=${yes_cost:.2f}), capping")
+                                self.logger.info(f"COST BASIS CONSTRAINT: NO bid ${no_bid:.3f} exceeds "
+                                               f"max ${max_no_bid:.3f} (YES cost=${yes_cost:.3f}), capping")
                                 no_bid = max(0.02, max_no_bid)
                     elif q < 0:  # Long NO, constraining YES bid
                         no_cost = position_info.get('no_cost', 0)
                         if no_cost > 0:
-                            max_yes_bid = round(1.00 - no_cost - min_profit_margin, 2)
+                            max_yes_bid = 1.00 - no_cost - min_profit_margin
+                            if self.use_subpenny:
+                                max_yes_bid = round(max_yes_bid * 200) / 200
+                            else:
+                                max_yes_bid = round(max_yes_bid, 2)
                             if yes_bid > max_yes_bid:
-                                self.logger.info(f"COST BASIS CONSTRAINT: YES bid ${yes_bid:.2f} exceeds "
-                                               f"max ${max_yes_bid:.2f} (NO cost=${no_cost:.2f}), capping")
+                                self.logger.info(f"COST BASIS CONSTRAINT: YES bid ${yes_bid:.3f} exceeds "
+                                               f"max ${max_yes_bid:.3f} (NO cost=${no_cost:.3f}), capping")
                                 yes_bid = max(0.02, max_yes_bid)
                 except Exception as e:
                     self.logger.warning(f"Could not get cost basis for constraint check: {e}")
 
-            # Normal market making mode
-            # Cancel all existing orders first (order management requirement)
-            self.cancel_existing_orders()
+            # Log market state
+            if self.use_subpenny:
+                self.logger.info(f"Market: YES mid=${yes_mid:.3f}, NO mid=${no_mid:.3f} (sub-penny)")
+                self.logger.info(f"Position: {q} | Desired: BUY YES @${yes_bid:.3f}, BUY NO @${no_bid:.3f}")
+            else:
+                self.logger.info(f"Market: YES mid=${yes_mid:.2f}, NO mid=${no_mid:.2f}")
+                self.logger.info(f"Position: {q} | Desired: BUY YES @${yes_bid:.2f}, BUY NO @${no_bid:.2f}")
 
-            self.logger.info(f"Market: YES mid=${yes_mid:.2f}, NO mid=${no_mid:.2f}")
-            self.logger.info(f"Position: {q} | Quotes: BUY YES @${yes_bid:.2f}, BUY NO @${no_bid:.2f}")
-
-            position_limit = int(self.max_position * (1 - self.position_limit_buffer))
-            expiration_ts = int(time.time()) + self.order_expiration
-
-            # Place BUY YES order (if not at max long position)
-            if q < position_limit:
-                self.logger.info(f"Placing BUY YES at ${yes_bid:.2f}")
-                try:
-                    self.active_yes_order_id = self.api.place_order(
-                        "buy", "yes", yes_bid, 1, expiration_ts
-                    )
-                except Exception as e:
-                    self.logger.error(f"Failed to place YES order: {e}")
-
-            # Place BUY NO order (effectively a sell YES when filled)
-            # Only place if we have room in position or need to reduce YES exposure
-            if q > -position_limit:
-                self.logger.info(f"Placing BUY NO at ${no_bid:.2f}")
-                try:
-                    self.active_no_order_id = self.api.place_order(
-                        "buy", "no", no_bid, 1, expiration_ts
-                    )
-                except Exception as e:
-                    self.logger.error(f"Failed to place NO order: {e}")
+            # DESIRED STATE ENGINE: Reconcile orders instead of cancel-and-replace
+            # This preserves queue priority and uses decrease endpoint when appropriate
+            self.reconcile_orders(yes_bid, no_bid, desired_count=1, position=q)
 
             self.t += dt
 
@@ -1105,11 +1515,12 @@ class AvellanedaMarketMaker:
 
     def run(self, dt: float):
         """Run the market maker loop until T is reached."""
-        self.logger.info(f"Starting Dual-Quote market maker (T={self.T}s, dt={dt}s)")
+        self.logger.info(f"Starting Desired State Engine market maker (T={self.T}s, dt={dt}s)")
         self.logger.info(f"Parameters: gamma={self.gamma}, sigma={self.sigma}, "
-                        f"spread=[{self.min_spread:.2f}, {self.max_spread:.2f}], "
                         f"flip_skew={self.flip_skew_factor}")
+        self.logger.info(f"Queue priority: MIN_ORDER_AGE={self.MIN_ORDER_AGE}s (won't reprice younger orders)")
         self.logger.info(f"Auto-exit: timeout={self.exit_timeout}s, profit_target=${self.exit_profit_target:.2f}")
+        self.logger.info(f"Tick-aware pricing: 2¢ spread for 1¢ markets, 1¢ spread for 0.5¢ markets")
         while self.t < self.T:
             self.run_iteration(dt)
             time.sleep(dt)

@@ -1,6 +1,7 @@
 # Kalshi Market Maker Configuration
 # Updated: January 2026
 # Mode: Dynamic - auto-fetches active markets
+# Engine: Desired State Engine with queue priority preservation
 
 # =============================================================================
 # MARKET DISCOVERY
@@ -41,6 +42,9 @@ refresh_interval: 300
 market_duration: 3600
 
 # Loop interval - how often to update quotes (in seconds)
+# NOTE: The Desired State Engine preserves queue priority, so frequent updates
+# won't hurt your position in line (orders only reprice if price changes AND
+# order age > MIN_ORDER_AGE)
 dt: 2.0
 
 # Maximum number of markets to trade simultaneously
@@ -71,9 +75,39 @@ market_maker:
   max_position: 5              # Max contracts per side
   position_limit_buffer: 0.1   # 10% buffer near limits
 
-  # Spread settings (hard adaptive caps)
-  min_spread: 0.02             # $0.02 minimum spread (bid 1¢ below mid)
-  max_spread: 0.02             # $0.02 maximum spread (bid 1¢ below mid)
+  # ==========================================================================
+  # DESIRED STATE ENGINE - TICK-AWARE PRICING
+  # ==========================================================================
+  # The engine automatically detects the market's min_tick_size and adjusts:
+  #
+  # STANDARD MARKETS (min_tick_size = 0.01 = 1 cent):
+  #   - Spread: 2 cents (bid 1¢ below mid)
+  #   - Uses integer cent pricing (yes_price/no_price)
+  #
+  # SUB-PENNY MARKETS (min_tick_size = 0.005 = 0.5 cent):
+  #   - Spread: 1 cent (bid 0.5¢ below mid)
+  #   - Uses dollar string pricing (yes_price_dollars/no_price_dollars)
+  #   - Rounds to nearest half-cent
+  #
+  # NOTE: Some NBA/NFL games trade in half-pennies - the bot will automatically
+  # detect these and switch to sub-penny pricing mode.
+
+  # Spread settings (these are fallbacks; tick-aware logic takes precedence)
+  min_spread: 0.02             # $0.02 minimum spread (standard 1¢ tick markets)
+  max_spread: 0.02             # $0.02 maximum spread
+
+  # ==========================================================================
+  # QUEUE PRIORITY PRESERVATION
+  # ==========================================================================
+  # The Desired State Engine reconciles orders instead of cancel-and-replace:
+  #
+  # 1. If price matches: Keep order (preserve queue position)
+  #    - If quantity too high: Use POST /orders/{id}/decrease to trim
+  # 2. If price changed AND order age > MIN_ORDER_AGE (10s): Cancel and replace
+  # 3. If price changed AND order age < MIN_ORDER_AGE: Wait (stay in line)
+  #
+  # This prevents losing queue priority from frequent repricing.
+  # MIN_ORDER_AGE is hardcoded to 10 seconds in the engine.
 
   # Avellaneda-Stoikov parameters (calibrated for 0.00-1.00 probability scale)
   gamma: 0.02                  # Risk aversion (scaled down: 0.01-0.05 range)
