@@ -95,12 +95,12 @@ class KalshiTradingAPI(AbstractTradingAPI):
         message = f"{timestamp_ms}{method}{path}"
         self.logger.info(f"Signing message: {message}")
 
-        # Try with hash digest length (32 bytes for SHA256) instead of MAX_LENGTH
+        # Use PSS.DIGEST_LENGTH constant as per official Kalshi SDK
         signature = self.private_key.sign(
             message.encode('utf-8'),
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=hashes.SHA256.digest_size  # 32 bytes
+                salt_length=padding.PSS.DIGEST_LENGTH
             ),
             hashes.SHA256()
         )
