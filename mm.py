@@ -369,6 +369,47 @@ class KalshiTradingAPI(AbstractTradingAPI):
             self.logger.error(f"Failed to fetch markets for series {series_ticker}: {e}")
             raise
 
+    def get_active_markets_by_category(self, category: str = "Sports") -> List[Dict]:
+        """Get all open markets for a category (e.g., 'Sports').
+
+        This method fetches ALL sports markets at once without needing to know
+        specific series tickers in advance. It handles pagination to get all results.
+
+        Args:
+            category: The market category to fetch (default: "Sports")
+
+        Returns:
+            List of market dictionaries containing ticker, title, and other market info
+        """
+        self.logger.info(f"Fetching all markets for category: {category}")
+        all_markets = []
+        cursor = None
+
+        try:
+            while True:
+                # Build endpoint with pagination support
+                endpoint = f"/markets?category={category}&status=open&limit=200"
+                if cursor:
+                    endpoint += f"&cursor={cursor}"
+
+                response = self._make_request("GET", endpoint)
+                markets = response.get("markets", [])
+                all_markets.extend(markets)
+
+                # Check for pagination cursor
+                cursor = response.get("cursor")
+                if not cursor or not markets:
+                    break
+
+                self.logger.info(f"Fetched {len(all_markets)} markets so far, continuing pagination...")
+
+            self.logger.info(f"Found {len(all_markets)} total open markets in category {category}")
+            return all_markets
+
+        except Exception as e:
+            self.logger.error(f"Failed to fetch markets for category {category}: {e}")
+            raise
+
 
 class AvellanedaMarketMaker:
     """Market maker using Avellaneda-Stoikov strategy."""

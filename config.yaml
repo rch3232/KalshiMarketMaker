@@ -1,22 +1,32 @@
 # Kalshi Market Maker Configuration
 # Updated: January 2026
-# Mode: Dynamic - auto-fetches active games from configured series
+# Mode: Dynamic - auto-fetches active markets
 
 # =============================================================================
-# SERIES TO TRADE
+# MARKET DISCOVERY
 # =============================================================================
-# The bot will automatically fetch all active/open markets from these series
-# and run market makers for each game
+# The bot can discover markets in two ways:
+#
+# 1. CATEGORY (Recommended): Set 'category' to automatically find ALL markets
+#    in that category. For sports betting, use "Sports" to get every game,
+#    spread, and player prop currently open for trading.
+#
+# 2. SERIES (Legacy): Set 'series' list to fetch specific series only.
+#    This requires knowing the exact series tickers in advance.
 
-series:
-  # NFL Individual Games
-  - KXNFLGAME      # NFL Moneyline (who wins)
-  - KXNFLSPREAD    # NFL Point Spread
-  - KXNFLTOTAL     # NFL Total Points
+# Use category-based discovery to find ALL sports markets automatically
+# This finds NFL, NBA, MLB, NHL, soccer, and any other sports markets
+category: Sports
 
-  # NBA Individual Games
-  - KXNBAGAME      # NBA Moneyline (who wins)
-  - KXNBATOTAL     # NBA Total Points
+# Legacy series-based approach (uncomment to use instead of category):
+# series:
+#   # NFL Individual Games
+#   - KXNFLGAME      # NFL Moneyline (who wins)
+#   - KXNFLSPREAD    # NFL Point Spread
+#   - KXNFLTOTAL     # NFL Total Points
+#   # NBA Individual Games
+#   - KXNBAGAME      # NBA Moneyline (who wins)
+#   - KXNBATOTAL     # NBA Total Points
 
 # =============================================================================
 # TIMING SETTINGS

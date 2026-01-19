@@ -153,13 +153,63 @@ def fetch_active_markets(series_list: List[str], api_key: str, private_key: str,
     return active_tickers
 
 
+def fetch_active_markets_by_category(category: str, api_key: str, private_key: str, base_url: str) -> List[str]:
+    """Fetch all active market tickers for a category (e.g., 'Sports').
+
+    This function fetches ALL sports markets at once without needing to know
+    specific series tickers (like KXNFLGAME, KXNBAGAME, etc.) in advance.
+
+    Args:
+        category: The market category to fetch (e.g., "Sports")
+        api_key: Kalshi API key
+        private_key: Kalshi private key (bytes or string)
+        base_url: Kalshi API base URL
+
+    Returns:
+        List of active market ticker strings
+    """
+    logger = logging.getLogger("MarketFetcher")
+    active_tickers = []
+
+    try:
+        temp_api = KalshiTradingAPI(
+            api_key=api_key,
+            private_key=private_key,
+            market_ticker="DUMMY",
+            base_url=base_url,
+            logger=logger
+        )
+
+        markets = temp_api.get_active_markets_by_category(category)
+        for market in markets:
+            ticker = market.get('ticker')
+            if ticker:
+                active_tickers.append(ticker)
+                # Log with additional context about the market
+                title = market.get('title', 'Unknown')
+                subtitle = market.get('subtitle', '')
+                logger.info(f"Found active market: {ticker} - {title} {subtitle}".strip())
+
+        temp_api.logout()
+        logger.info(f"Total markets found in category '{category}': {len(active_tickers)}")
+
+    except Exception as e:
+        logger.error(f"Failed to fetch markets for category {category}: {e}")
+
+    return active_tickers
+
+
 def run_dynamic_strategies(config: Dict):
     """
     Main loop that:
-    1. Fetches active markets for configured series
+    1. Fetches active markets by category (e.g., 'Sports') or by series list
     2. Starts market makers for new markets
     3. Handles market expiration gracefully
     4. Refreshes market list periodically
+
+    The bot can discover markets in two ways:
+    - By category (recommended): Set 'category: Sports' to find ALL sports markets automatically
+    - By series (legacy): Set 'series: [KXNFLGAME, KXNBAGAME, ...]' for specific series only
     """
     api_key = os.getenv("KALSHI_API_KEY")
     private_key_env = os.getenv("KALSHI_PRIVATE_KEY")
@@ -187,6 +237,9 @@ def run_dynamic_strategies(config: Dict):
         return
 
     # Extract configuration
+    # New approach: use 'category' (e.g., "Sports") to fetch ALL sports markets
+    # Legacy approach: use 'series' list for specific series tickers
+    category = config.get('category')
     series_list = config.get('series', [])
     mm_config = config.get('market_maker', {})
     dt = config.get('dt', 2.0)
@@ -195,7 +248,12 @@ def run_dynamic_strategies(config: Dict):
     max_concurrent_markets = config.get('max_concurrent_markets', 10)
 
     runner_logger.info(f"Starting dynamic market maker")
-    runner_logger.info(f"Series to trade: {series_list}")
+    if category:
+        runner_logger.info(f"Market discovery mode: CATEGORY ('{category}')")
+        runner_logger.info(f"  Will automatically find ALL markets in the '{category}' category")
+    else:
+        runner_logger.info(f"Market discovery mode: SERIES (legacy)")
+        runner_logger.info(f"  Series to trade: {series_list}")
     runner_logger.info(f"Refresh interval: {refresh_interval}s")
     runner_logger.info(f"Market duration per cycle: {market_duration}s")
     runner_logger.info(f"Max concurrent markets: {max_concurrent_markets}")
@@ -205,9 +263,12 @@ def run_dynamic_strategies(config: Dict):
     with ThreadPoolExecutor(max_workers=max_concurrent_markets) as executor:
         while True:
             try:
-                # Fetch current active markets
+                # Fetch current active markets using category or series approach
                 runner_logger.info("Fetching active markets...")
-                active_tickers = fetch_active_markets(series_list, api_key, private_key, base_url)
+                if category:
+                    active_tickers = fetch_active_markets_by_category(category, api_key, private_key, base_url)
+                else:
+                    active_tickers = fetch_active_markets(series_list, api_key, private_key, base_url)
                 runner_logger.info(f"Found {len(active_tickers)} active markets")
 
                 # Clean up completed futures
