@@ -101,10 +101,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
     def get_position(self) -> int:
         self.logger.info("Retrieving position...")
         try:
-            response = self.client.get_positions(
-                ticker=self.market_ticker,
-                settlement_status="unsettled"
-            )
+            # Get positions - the SDK may have different parameter names
+            response = self.client.get_positions(ticker=self.market_ticker)
             positions = response.market_positions or []
 
             total_position = 0
