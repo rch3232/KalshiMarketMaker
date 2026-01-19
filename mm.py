@@ -1,13 +1,15 @@
 import abc
 import time
 import re
+import requests
+import json
 from typing import Dict, List, Tuple
 import logging
 import uuid
 import math
-
-# Use official Kalshi Python client for authentication
-from kalshi_python import Configuration, KalshiClient
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.backends import default_backend
 
 
 class AbstractTradingAPI(abc.ABC):
@@ -33,6 +35,8 @@ class AbstractTradingAPI(abc.ABC):
 
 
 class KalshiTradingAPI(AbstractTradingAPI):
+    """Kalshi Trading API with direct RSA-PSS signature implementation."""
+
     def __init__(
         self,
         api_key: str,
@@ -44,72 +48,115 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.api_key = api_key
         self.market_ticker = market_ticker
         self.logger = logger
-        self.base_url = base_url
+        self.base_url = base_url.rstrip('/')
 
-        # Normalize the private key PEM format
-        private_key = self._normalize_pem_key(private_key, logger)
-
-        # Configure official Kalshi client with proper host URL
-        config = Configuration()
-        config.host = base_url
-        config.api_key_id = api_key
-        config.private_key_pem = private_key
-
-        # Initialize official Kalshi client
-        self.client = KalshiClient(configuration=config)
-        self.logger.info(f"API key authentication initialized via official Kalshi client (host: {base_url})")
+        # Normalize and load the private key
+        private_key_pem = self._normalize_pem_key(private_key, logger)
+        self.private_key = serialization.load_pem_private_key(
+            private_key_pem.encode(),
+            password=None,
+            backend=default_backend()
+        )
+        self.logger.info(f"RSA private key loaded successfully")
+        self.logger.info(f"API initialized for market: {market_ticker}")
 
     @staticmethod
     def _normalize_pem_key(key: str, logger: logging.Logger) -> str:
-        """Normalize a PEM key that may have various formatting issues from env vars."""
-        original_key = key
-
-        # Handle escaped newlines from environment variables
+        """Normalize a PEM key that may have formatting issues."""
+        # Handle escaped newlines
         key = key.replace('\\n', '\n')
         key = key.replace('\\r', '')
         key = key.replace('\r', '')
 
-        # Check if the key looks properly formatted already
         lines = key.strip().split('\n')
         if (len(lines) > 3 and
             lines[0].startswith('-----BEGIN') and
             lines[-1].startswith('-----END')):
-            # Key appears properly formatted, just ensure trailing newline
-            logger.info(f"PEM key looks properly formatted ({len(lines)} lines)")
-            logger.info(f"PEM key starts with: {lines[0]}")
-            logger.info(f"PEM key ends with: {lines[-1]}")
+            logger.info(f"PEM key properly formatted ({len(lines)} lines)")
             return key.strip() + '\n'
 
-        # If the key is all on one line (no newlines), try to reconstruct it
-        logger.info("PEM key appears malformed, attempting reconstruction...")
-        match = re.match(r'(-----BEGIN [A-Z ]+-----)(.+)(-----END [A-Z ]+-----)', key.replace(' ', '').replace('\n', ''))
+        # Try to reconstruct malformed key
+        logger.info("Attempting to reconstruct PEM key...")
+        match = re.match(r'(-----BEGIN [A-Z ]+-----)(.+)(-----END [A-Z ]+-----)',
+                        key.replace(' ', '').replace('\n', ''))
         if match:
             header, data, footer = match.groups()
-            # Split data into 64-character lines
             data_lines = [data[i:i+64] for i in range(0, len(data), 64)]
             key = header + '\n' + '\n'.join(data_lines) + '\n' + footer + '\n'
-            logger.info("PEM key reconstructed successfully")
-        else:
-            logger.warning("Could not parse PEM key structure, using as-is")
-            key = original_key
-
+            logger.info("PEM key reconstructed")
         return key
 
+    def _sign_request(self, method: str, path: str, timestamp_ms: int) -> str:
+        """Generate RSA-PSS signature for Kalshi API request."""
+        # Message format: timestamp_ms + method + path
+        message = f"{timestamp_ms}{method}{path}"
+        self.logger.debug(f"Signing message: {message}")
+
+        signature = self.private_key.sign(
+            message.encode('utf-8'),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+
+        import base64
+        return base64.b64encode(signature).decode('utf-8')
+
+    def _make_request(self, method: str, endpoint: str, data: dict = None) -> dict:
+        """Make an authenticated request to the Kalshi API."""
+        # Build full URL and path for signing
+        url = f"{self.base_url}{endpoint}"
+
+        # Generate timestamp in milliseconds
+        timestamp_ms = int(time.time() * 1000)
+
+        # Sign the request (path includes query params for GET)
+        signature = self._sign_request(method.upper(), endpoint, timestamp_ms)
+
+        headers = {
+            "Content-Type": "application/json",
+            "KALSHI-ACCESS-KEY": self.api_key,
+            "KALSHI-ACCESS-SIGNATURE": signature,
+            "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
+        }
+
+        try:
+            if method.upper() == "GET":
+                response = requests.get(url, headers=headers, timeout=30)
+            elif method.upper() == "POST":
+                response = requests.post(url, headers=headers, json=data, timeout=30)
+            elif method.upper() == "DELETE":
+                response = requests.delete(url, headers=headers, timeout=30)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+
+            if response.status_code == 401:
+                self.logger.error(f"Authentication failed: {response.text}")
+                raise Exception(f"Authentication error: {response.text}")
+
+            response.raise_for_status()
+            return response.json() if response.text else {}
+
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Request failed: {e}")
+            raise
+
     def logout(self):
-        """No logout needed for API key auth - included for compatibility."""
+        """No logout needed for API key auth."""
         self.logger.info("Session ended (API key auth - no logout required)")
 
     def get_position(self) -> int:
         self.logger.info("Retrieving position...")
         try:
-            # Get positions - the SDK may have different parameter names
-            response = self.client.get_positions(ticker=self.market_ticker)
-            positions = response.market_positions or []
+            response = self._make_request("GET", f"/portfolio/positions?ticker={self.market_ticker}")
+            positions = response.get("market_positions", [])
 
             total_position = 0
             for position in positions:
-                if position.ticker == self.market_ticker:
-                    total_position += position.position
+                if position.get("ticker") == self.market_ticker:
+                    total_position += position.get("position", 0)
 
             self.logger.info(f"Current position: {total_position}")
             return total_position
@@ -120,13 +167,13 @@ class KalshiTradingAPI(AbstractTradingAPI):
     def get_price(self) -> Dict[str, float]:
         self.logger.info("Retrieving market data...")
         try:
-            response = self.client.get_market(self.market_ticker)
-            market = response.market
+            response = self._make_request("GET", f"/markets/{self.market_ticker}")
+            market = response.get("market", {})
 
-            yes_bid = float(market.yes_bid) / 100
-            yes_ask = float(market.yes_ask) / 100
-            no_bid = float(market.no_bid) / 100
-            no_ask = float(market.no_ask) / 100
+            yes_bid = float(market.get("yes_bid", 0)) / 100
+            yes_ask = float(market.get("yes_ask", 0)) / 100
+            no_bid = float(market.get("no_bid", 0)) / 100
+            no_ask = float(market.get("no_ask", 0)) / 100
 
             yes_mid_price = round((yes_bid + yes_ask) / 2, 2)
             no_mid_price = round((no_bid + no_ask) / 2, 2)
@@ -143,8 +190,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
         try:
             price_cents = int(price * 100)
 
-            # Build order params
-            order_params = {
+            order_data = {
                 "ticker": self.market_ticker,
                 "action": action.lower(),
                 "type": "limit",
@@ -154,15 +200,15 @@ class KalshiTradingAPI(AbstractTradingAPI):
             }
 
             if side == "yes":
-                order_params["yes_price"] = price_cents
+                order_data["yes_price"] = price_cents
             else:
-                order_params["no_price"] = price_cents
+                order_data["no_price"] = price_cents
 
             if expiration_ts is not None:
-                order_params["expiration_ts"] = expiration_ts
+                order_data["expiration_ts"] = expiration_ts
 
-            response = self.client.create_order(**order_params)
-            order_id = response.order.order_id
+            response = self._make_request("POST", "/portfolio/orders", order_data)
+            order_id = response.get("order", {}).get("order_id")
             self.logger.info(f"Placed {action} order, order ID: {order_id}")
             return str(order_id)
         except Exception as e:
@@ -172,8 +218,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
     def cancel_order(self, order_id: int) -> bool:
         self.logger.info(f"Canceling order with ID {order_id}...")
         try:
-            response = self.client.cancel_order(order_id=str(order_id))
-            success = response.reduced_by > 0
+            response = self._make_request("DELETE", f"/portfolio/orders/{order_id}")
+            success = response.get("reduced_by", 0) > 0
             self.logger.info(f"Canceled order with ID {order_id}, success: {success}")
             return success
         except Exception as e:
@@ -183,85 +229,48 @@ class KalshiTradingAPI(AbstractTradingAPI):
     def get_orders(self) -> List[Dict]:
         self.logger.info("Retrieving orders...")
         try:
-            response = self.client.get_orders(
-                ticker=self.market_ticker,
-                status="resting"
-            )
-            orders = response.orders or []
-            # Convert to dict format for compatibility
-            orders_list = []
-            for order in orders:
-                orders_list.append({
-                    'order_id': order.order_id,
-                    'ticker': order.ticker,
-                    'action': order.action,
-                    'side': order.side,
-                    'yes_price': order.yes_price,
-                    'no_price': order.no_price,
-                    'remaining_count': order.remaining_count,
-                })
-            self.logger.info(f"Retrieved {len(orders_list)} orders")
-            return orders_list
+            response = self._make_request("GET", f"/portfolio/orders?ticker={self.market_ticker}&status=resting")
+            orders = response.get("orders", [])
+            self.logger.info(f"Retrieved {len(orders)} open orders")
+            return orders
         except Exception as e:
             self.logger.error(f"Failed to get orders: {e}")
             raise
 
-    def get_active_markets_by_series(self, series_ticker: str) -> List[Dict]:
-        """Fetch all active/open markets for a given series ticker."""
-        self.logger.info(f"Fetching active markets for series: {series_ticker}")
+    def get_markets_by_series(self, series_ticker: str) -> List[Dict]:
+        """Get all open markets for a series."""
+        self.logger.info(f"Fetching markets for series: {series_ticker}")
         try:
-            response = self.client.get_markets(
-                series_ticker=series_ticker,
-                status="open",
-                limit=100
-            )
-            markets = response.markets or []
-            # Convert to dict format
-            markets_list = []
-            for market in markets:
-                markets_list.append({
-                    'ticker': market.ticker,
-                    'title': getattr(market, 'title', ''),
-                    'status': market.status,
-                })
-            self.logger.info(f"Found {len(markets_list)} active markets for series {series_ticker}")
-            return markets_list
+            response = self._make_request("GET", f"/markets?series_ticker={series_ticker}&status=open")
+            markets = response.get("markets", [])
+            self.logger.info(f"Found {len(markets)} open markets in series {series_ticker}")
+            return markets
         except Exception as e:
-            self.logger.error(f"Failed to get markets: {e}")
+            self.logger.error(f"Failed to fetch markets for series {series_ticker}: {e}")
             raise
-
-    def cancel_all_orders_for_market(self) -> int:
-        """Cancel all resting orders for the current market."""
-        orders = self.get_orders()
-        cancelled = 0
-        for order in orders:
-            try:
-                self.cancel_order(order['order_id'])
-                cancelled += 1
-            except Exception as e:
-                self.logger.error(f"Failed to cancel order {order['order_id']}: {e}")
-        return cancelled
 
 
 class AvellanedaMarketMaker:
+    """Market maker using Avellaneda-Stoikov strategy."""
+
     def __init__(
         self,
         logger: logging.Logger,
         api: AbstractTradingAPI,
-        gamma: float,
-        k: float,
-        sigma: float,
-        T: float,
-        max_position: int,
-        order_expiration: int,
+        gamma: float = 0.1,
+        k: float = 1.5,
+        sigma: float = 0.5,
+        T: float = 3600,
+        max_position: int = 100,
+        order_expiration: int = 300,
         min_spread: float = 0.01,
         position_limit_buffer: float = 0.1,
         inventory_skew_factor: float = 0.01,
-        trade_side: str = "yes"
+        trade_side: str = "yes",
     ):
-        self.api = api
         self.logger = logger
-        self.base_gamma = gamma
+        self.api = api
+        self.gamma = gamma
         self.k = k
         self.sigma = sigma
         self.T = T
@@ -272,123 +281,82 @@ class AvellanedaMarketMaker:
         self.inventory_skew_factor = inventory_skew_factor
         self.trade_side = trade_side
 
-    def run(self, dt: float):
-        start_time = time.time()
-        while time.time() - start_time < self.T:
-            current_time = time.time() - start_time
-            self.logger.info(f"Running Avellaneda market maker at {current_time:.2f}")
+        self.t = 0
+        self.active_bid_id = None
+        self.active_ask_id = None
 
-            try:
-                mid_prices = self.api.get_price()
-                mid_price = mid_prices[self.trade_side]
-                inventory = self.api.get_position()
-                self.logger.info(f"Current mid price for {self.trade_side}: {mid_price:.4f}, Inventory: {inventory}")
+    def compute_reservation_price(self, mid_price: float, q: int, t: float) -> float:
+        """Compute reservation price with inventory adjustment."""
+        time_factor = max(0.001, self.T - t)
+        r = mid_price - q * self.gamma * (self.sigma ** 2) * time_factor
+        return r
 
-                reservation_price = self.calculate_reservation_price(mid_price, inventory, current_time)
-                bid_price, ask_price = self.calculate_asymmetric_quotes(mid_price, inventory, current_time)
-                buy_size, sell_size = self.calculate_order_sizes(inventory)
+    def compute_optimal_spread(self, t: float) -> float:
+        """Compute optimal spread based on Avellaneda-Stoikov model."""
+        time_factor = max(0.001, self.T - t)
+        spread = self.gamma * (self.sigma ** 2) * time_factor + (2 / self.gamma) * math.log(1 + self.gamma / self.k)
+        return max(spread, self.min_spread)
 
-                self.logger.info(f"Reservation price: {reservation_price:.4f}")
-                self.logger.info(f"Computed desired bid: {bid_price:.4f}, ask: {ask_price:.4f}")
+    def compute_quotes(self, mid_price: float, q: int, t: float) -> Tuple[float, float]:
+        """Compute bid and ask prices."""
+        r = self.compute_reservation_price(mid_price, q, t)
+        spread = self.compute_optimal_spread(t)
 
-                self.manage_orders(bid_price, ask_price, buy_size, sell_size)
-            except Exception as e:
-                self.logger.error(f"Error in market maker loop: {e}")
+        inventory_skew = q * self.inventory_skew_factor
+        bid_price = r - spread / 2 - inventory_skew
+        ask_price = r + spread / 2 - inventory_skew
 
-            time.sleep(dt)
+        bid_price = max(0.01, min(0.99, round(bid_price, 2)))
+        ask_price = max(0.01, min(0.99, round(ask_price, 2)))
 
-        self.logger.info("Avellaneda market maker finished running")
-
-    def calculate_asymmetric_quotes(self, mid_price: float, inventory: int, t: float) -> Tuple[float, float]:
-        reservation_price = self.calculate_reservation_price(mid_price, inventory, t)
-        base_spread = self.calculate_optimal_spread(t, inventory)
-
-        position_ratio = inventory / self.max_position
-        spread_adjustment = base_spread * abs(position_ratio) * 3
-
-        if inventory > 0:
-            bid_spread = base_spread / 2 + spread_adjustment
-            ask_spread = max(base_spread / 2 - spread_adjustment, self.min_spread / 2)
-        else:
-            bid_spread = max(base_spread / 2 - spread_adjustment, self.min_spread / 2)
-            ask_spread = base_spread / 2 + spread_adjustment
-
-        bid_price = max(0, min(mid_price, reservation_price - bid_spread))
-        ask_price = min(1, max(mid_price, reservation_price + ask_spread))
+        if ask_price <= bid_price:
+            mid = (bid_price + ask_price) / 2
+            bid_price = round(mid - self.min_spread / 2, 2)
+            ask_price = round(mid + self.min_spread / 2, 2)
 
         return bid_price, ask_price
 
-    def calculate_reservation_price(self, mid_price: float, inventory: int, t: float) -> float:
-        dynamic_gamma = self.calculate_dynamic_gamma(inventory)
-        inventory_skew = inventory * self.inventory_skew_factor * mid_price
-        return mid_price + inventory_skew - inventory * dynamic_gamma * (self.sigma**2) * (1 - t/self.T)
+    def cancel_existing_orders(self):
+        """Cancel all existing orders."""
+        try:
+            orders = self.api.get_orders()
+            for order in orders:
+                order_id = order.get("order_id")
+                if order_id:
+                    try:
+                        self.api.cancel_order(order_id)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to cancel order {order_id}: {e}")
+        except Exception as e:
+            self.logger.error(f"Failed to get orders for cancellation: {e}")
 
-    def calculate_optimal_spread(self, t: float, inventory: int) -> float:
-        dynamic_gamma = self.calculate_dynamic_gamma(inventory)
-        base_spread = (dynamic_gamma * (self.sigma**2) * (1 - t/self.T) +
-                       (2 / dynamic_gamma) * math.log(1 + (dynamic_gamma / self.k)))
-        position_ratio = abs(inventory) / self.max_position
-        spread_adjustment = 1 - (position_ratio ** 2)
-        return max(base_spread * spread_adjustment * 0.01, self.min_spread)
+    def run_iteration(self, dt: float):
+        """Run one iteration of the market making loop."""
+        try:
+            price_data = self.api.get_price()
+            mid_price = price_data[self.trade_side]
+            q = self.api.get_position()
 
-    def calculate_dynamic_gamma(self, inventory: int) -> float:
-        position_ratio = inventory / self.max_position
-        return self.base_gamma * math.exp(-abs(position_ratio))
+            self.cancel_existing_orders()
 
-    def calculate_order_sizes(self, inventory: int) -> Tuple[int, int]:
-        remaining_capacity = self.max_position - abs(inventory)
-        buffer_size = int(self.max_position * self.position_limit_buffer)
+            bid_price, ask_price = self.compute_quotes(mid_price, q, self.t)
 
-        if inventory > 0:
-            buy_size = max(1, min(buffer_size, remaining_capacity))
-            sell_size = max(1, self.max_position)
-        else:
-            buy_size = max(1, self.max_position)
-            sell_size = max(1, min(buffer_size, remaining_capacity))
+            self.logger.info(f"Mid price: ${mid_price:.2f}, Position: {q}")
+            self.logger.info(f"Computed bid: ${bid_price:.2f}, ask: ${ask_price:.2f}")
 
-        return buy_size, sell_size
+            position_limit = int(self.max_position * (1 - self.position_limit_buffer))
+            expiration_ts = int(time.time()) + self.order_expiration
 
-    def manage_orders(self, bid_price: float, ask_price: float, buy_size: int, sell_size: int):
-        current_orders = self.api.get_orders()
-        self.logger.info(f"Retrieved {len(current_orders)} total orders")
+            if q < position_limit:
+                self.logger.info(f"Placing bid at ${bid_price:.2f}")
+                self.api.place_order("buy", self.trade_side, bid_price, 1, expiration_ts)
 
-        buy_orders = []
-        sell_orders = []
+            if q > -position_limit:
+                self.logger.info(f"Placing ask at ${ask_price:.2f}")
+                self.api.place_order("sell", self.trade_side, ask_price, 1, expiration_ts)
 
-        for order in current_orders:
-            if order['side'] == self.trade_side:
-                if order['action'] == 'buy':
-                    buy_orders.append(order)
-                elif order['action'] == 'sell':
-                    sell_orders.append(order)
+            self.t += dt
 
-        self.logger.info(f"Current buy orders: {len(buy_orders)}")
-        self.logger.info(f"Current sell orders: {len(sell_orders)}")
-
-        # Handle buy orders
-        self.handle_order_side('buy', buy_orders, bid_price, buy_size)
-
-        # Handle sell orders
-        self.handle_order_side('sell', sell_orders, ask_price, sell_size)
-
-    def handle_order_side(self, action: str, orders: List[Dict], desired_price: float, desired_size: int):
-        keep_order = None
-        for order in orders:
-            current_price = float(order['yes_price']) / 100 if self.trade_side == 'yes' else float(order['no_price']) / 100
-            if keep_order is None and abs(current_price - desired_price) < 0.01 and order['remaining_count'] == desired_size:
-                keep_order = order
-                self.logger.info(f"Keeping existing {action} order. ID: {order['order_id']}, Price: {current_price:.4f}")
-            else:
-                self.logger.info(f"Cancelling extraneous {action} order. ID: {order['order_id']}, Price: {current_price:.4f}")
-                self.api.cancel_order(order['order_id'])
-
-        current_price = self.api.get_price()[self.trade_side]
-        if keep_order is None:
-            if (action == 'buy' and desired_price < current_price) or (action == 'sell' and desired_price > current_price):
-                try:
-                    order_id = self.api.place_order(action, self.trade_side, desired_price, desired_size, int(time.time()) + self.order_expiration)
-                    self.logger.info(f"Placed new {action} order. ID: {order_id}, Price: {desired_price:.4f}, Size: {desired_size}")
-                except Exception as e:
-                    self.logger.error(f"Failed to place {action} order: {str(e)}")
-            else:
-                self.logger.info(f"Skipped placing {action} order. Desired price {desired_price:.4f} does not improve on current price {current_price:.4f}")
+        except Exception as e:
+            self.logger.error(f"Error in market maker loop: {e}")
+            raise
