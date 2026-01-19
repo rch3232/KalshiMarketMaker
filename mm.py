@@ -89,6 +89,38 @@ class KalshiTradingAPI(AbstractTradingAPI):
         self.logger.info(f"RSA private key loaded successfully")
         self.logger.info(f"API initialized for market: {market_ticker}")
 
+    def test_connection(self) -> bool:
+        """Test the API connection and credentials. Returns True if successful."""
+        self.logger.info("Testing API connection...")
+        self.logger.info(f"  API Key: {self.api_key[:8]}...{self.api_key[-4:]}")
+        self.logger.info(f"  Host: {self.host}")
+
+        try:
+            # Try to get account balance - a simple authenticated endpoint
+            response = self._make_request("GET", "/portfolio/balance")
+            balance = response.get("balance", 0) / 100  # Convert cents to dollars
+            self.logger.info(f"  Connection successful! Account balance: ${balance:.2f}")
+            return True
+        except Exception as e:
+            error_msg = str(e)
+            self.logger.error(f"  Connection test FAILED: {error_msg}")
+
+            # Provide helpful diagnostics
+            if "INCORRECT_API_KEY_SIGNATURE" in error_msg:
+                self.logger.error("  DIAGNOSTIC: Signature mismatch. Possible causes:")
+                self.logger.error("    1. Private key doesn't match this API key")
+                self.logger.error("    2. API key was regenerated (invalidates old private key)")
+                self.logger.error("    3. Environment mismatch (demo keys on prod, or vice versa)")
+                self.logger.error(f"    4. Check KALSHI_BASE_URL matches your API key environment")
+                self.logger.error(f"       Demo: https://demo-api.kalshi.co")
+                self.logger.error(f"       Prod: https://api.elections.kalshi.com")
+            elif "INVALID_API_KEY" in error_msg:
+                self.logger.error("  DIAGNOSTIC: API key not recognized. Check KALSHI_API_KEY")
+            elif "authentication_error" in error_msg:
+                self.logger.error("  DIAGNOSTIC: General auth error. Verify credentials.")
+
+            return False
+
     @staticmethod
     def _normalize_pem_key(key: str, logger: logging.Logger) -> str:
         """Normalize a PEM key that may have formatting issues."""
@@ -165,7 +197,8 @@ class KalshiTradingAPI(AbstractTradingAPI):
                 with _time_offset_lock:
                     # Only update if drift is significant (> 500ms)
                     if abs(drift) > 500 and abs(drift - _time_offset_ms) > 100:
-                        self.logger.warning(f"Clock drift detected: {drift}ms (server ahead of local)")
+                        direction = "server ahead of local" if drift > 0 else "local ahead of server"
+                        self.logger.warning(f"Clock drift detected: {drift}ms ({direction})")
                         _time_offset_ms = drift
             except Exception as e:
                 self.logger.debug(f"Could not parse server Date header: {e}")

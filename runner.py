@@ -97,6 +97,27 @@ def run_market_for_duration(
     logger.info(f"Market maker for {market_ticker} finished")
 
 
+def test_api_connection(api_key: str, private_key: str, base_url: str) -> bool:
+    """Test API connection and credentials before starting market makers."""
+    logger = logging.getLogger("ConnectionTest")
+    logger.info("=" * 60)
+    logger.info("TESTING API CONNECTION")
+    logger.info("=" * 60)
+
+    try:
+        test_api = KalshiTradingAPI(
+            api_key=api_key,
+            private_key=private_key,
+            market_ticker="CONNECTION_TEST",
+            base_url=base_url,
+            logger=logger
+        )
+        return test_api.test_connection()
+    except Exception as e:
+        logger.error(f"Failed to initialize API: {e}")
+        return False
+
+
 def fetch_active_markets(series_list: List[str], api_key: str, private_key: str, base_url: str) -> List[str]:
     """Fetch all active market tickers for the given series list."""
     logger = logging.getLogger("MarketFetcher")
@@ -157,6 +178,13 @@ def run_dynamic_strategies(config: Dict):
         private_key = private_key_env
         # Handle newlines in private key (environment variables often escape them)
         private_key = private_key.replace('\\n', '\n')
+
+    # Test connection before proceeding
+    if not test_api_connection(api_key, private_key, base_url):
+        runner_logger.error("API connection test failed. Please check your credentials.")
+        runner_logger.error("Ensure KALSHI_API_KEY and KALSHI_PRIVATE_KEY match and are for the correct environment.")
+        runner_logger.error(f"Current KALSHI_BASE_URL: {base_url}")
+        return
 
     # Extract configuration
     series_list = config.get('series', [])
