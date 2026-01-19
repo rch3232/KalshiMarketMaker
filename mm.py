@@ -53,25 +53,40 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
     def _load_private_key(self, private_key_str: str):
         """Load RSA private key from PEM string."""
+        # Handle escaped newlines from environment variables
+        private_key_str = private_key_str.replace('\\n', '\n')
+
         # Handle the private key - it might be a file path or the key itself
         if private_key_str.startswith('-----BEGIN'):
             # It's already a PEM string
             key_data = private_key_str.encode('utf-8')
+        elif '-----BEGIN' in private_key_str:
+            # PEM markers are present but not at start - clean it up
+            key_data = private_key_str.encode('utf-8')
         else:
-            # Try to read as file path, or treat as raw key
+            # Try to read as file path
             try:
                 with open(private_key_str, 'rb') as f:
                     key_data = f.read()
-            except FileNotFoundError:
-                # Assume it's a base64 encoded key or raw PEM without proper newlines
+            except (FileNotFoundError, OSError):
+                # Assume it's base64 encoded key content without PEM headers
                 # Try to reconstruct PEM format
-                key_data = private_key_str.encode('utf-8')
+                clean_key = private_key_str.replace(' ', '').replace('\n', '')
+                # Add PEM headers and format with 64-char lines
+                lines = [clean_key[i:i+64] for i in range(0, len(clean_key), 64)]
+                pem_key = '-----BEGIN RSA PRIVATE KEY-----\n' + '\n'.join(lines) + '\n-----END RSA PRIVATE KEY-----'
+                key_data = pem_key.encode('utf-8')
 
-        return serialization.load_pem_private_key(
-            key_data,
-            password=None,
-            backend=default_backend()
-        )
+        try:
+            return serialization.load_pem_private_key(
+                key_data,
+                password=None,
+                backend=default_backend()
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to load private key: {e}")
+            self.logger.error(f"Key starts with: {private_key_str[:50]}...")
+            raise
 
     def _sign_request(self, timestamp: str, method: str, path: str) -> str:
         """Sign the request using RSA-PSS with SHA256."""
