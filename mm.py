@@ -26,6 +26,11 @@ _time_offset_ms = 0
 _time_offset_lock = threading.Lock()
 
 
+class MarketNotFoundError(Exception):
+    """Raised when Kalshi returns market_not_found error (market settled/delisted)."""
+    pass
+
+
 class SharedPositionTracker:
     """Thread-safe tracker for cross-market position awareness.
 
@@ -444,14 +449,21 @@ class KalshiTradingAPI(AbstractTradingAPI):
                 if data:
                     self.logger.error(f"Request data that caused error: {data}")
                 # Try to parse error details from JSON response
+                error_code = None
                 try:
                     error_json = response.json()
                     if 'error' in error_json:
+                        error_code = error_json['error'].get('code')
                         self.logger.error(f"API Error details: {error_json['error']}")
                     if 'message' in error_json:
                         self.logger.error(f"API Error message: {error_json['message']}")
                 except:
                     pass  # Response wasn't JSON
+
+                # Raise specific exception for market_not_found (market settled/delisted)
+                if error_code == 'market_not_found' or response.status_code == 404:
+                    raise MarketNotFoundError(f"Market {self.market_ticker} not found (settled or delisted)")
+
                 raise Exception(f"HTTP {response.status_code}: {error_body}")
 
             return response.json() if response.text else {}
@@ -2212,6 +2224,9 @@ class AvellanedaMarketMaker:
 
             self.t += dt
 
+        except MarketNotFoundError:
+            # Market has been settled or delisted - re-raise to stop gracefully
+            raise
         except Exception as e:
             self.logger.error(f"Error in market maker loop: {e}")
             raise
@@ -2225,6 +2240,10 @@ class AvellanedaMarketMaker:
         self.logger.info(f"Auto-exit: timeout={self.exit_timeout}s, profit_target=${self.exit_profit_target:.2f}")
         self.logger.info(f"Tick-aware pricing: 2¢ spread for 1¢ markets, 1¢ spread for 0.5¢ markets")
         self.logger.info(f"DUAL EXIT MODE: After timeout, sells owned side + continues bidding opposite for pair trade")
-        while self.t < self.T:
-            self.run_iteration(dt)
-            time.sleep(dt)
+        try:
+            while self.t < self.T:
+                self.run_iteration(dt)
+                time.sleep(dt)
+        except MarketNotFoundError as e:
+            self.logger.warning(f"Market closed/settled - stopping market maker: {e}")
+            # Don't re-raise - this is an expected condition, just exit gracefully
