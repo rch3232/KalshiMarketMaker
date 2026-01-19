@@ -461,6 +461,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
                 "side": side,
                 "count": quantity,
                 "client_order_id": str(uuid.uuid4()),
+                "post_only": True,  # Ensure maker status - reject if order would immediately match
             }
 
             if side == "yes":
@@ -473,7 +474,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
             response = self._make_request("POST", "/portfolio/orders", order_data)
             order_id = response.get("order", {}).get("order_id")
-            self.logger.info(f"Placed {action} order, order ID: {order_id}")
+            self.logger.info(f"Placed {action} order (post_only), order ID: {order_id}")
             return str(order_id)
         except Exception as e:
             self.logger.error(f"Failed to place order: {e}")
@@ -591,6 +592,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
                 "side": side,
                 "count": quantity,
                 "client_order_id": str(uuid.uuid4()),
+                "post_only": True,  # Ensure maker status - reject if order would immediately match
             }
 
             if use_dollars:
@@ -612,7 +614,7 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
             response = self._make_request("POST", "/portfolio/orders", order_data)
             order_id = response.get("order", {}).get("order_id")
-            self.logger.info(f"Placed {action} order, order ID: {order_id}")
+            self.logger.info(f"Placed {action} order (post_only), order ID: {order_id}")
             return str(order_id)
         except Exception as e:
             self.logger.error(f"Failed to place order: {e}")
