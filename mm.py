@@ -38,18 +38,20 @@ class AbstractTradingAPI(abc.ABC):
 class KalshiTradingAPI(AbstractTradingAPI):
     """Kalshi Trading API with direct RSA-PSS signature implementation."""
 
+    # Always use the official Kalshi API domain
+    API_BASE = "https://api.elections.kalshi.com"
+
     def __init__(
         self,
         api_key: str,
         private_key: str,
         market_ticker: str,
-        base_url: str,
+        base_url: str,  # kept for compatibility but not used
         logger: logging.Logger,
     ):
         self.api_key = api_key
         self.market_ticker = market_ticker
         self.logger = logger
-        self.base_url = base_url.rstrip('/')
 
         # Normalize and load the private key
         private_key_pem = self._normalize_pem_key(private_key, logger)
@@ -106,19 +108,20 @@ class KalshiTradingAPI(AbstractTradingAPI):
 
     def _make_request(self, method: str, endpoint: str, data: dict = None) -> dict:
         """Make an authenticated request to the Kalshi API."""
+        # Build the full path (must start with /trade-api/v2)
+        full_path = f"/trade-api/v2{endpoint}"
+
+        # For signing: strip query params
+        path_for_signing = full_path.split('?')[0]
+
         # Build full URL
-        url = f"{self.base_url}{endpoint}"
+        url = f"{self.API_BASE}{full_path}"
 
         # Generate timestamp in milliseconds (must be 13 digits)
         timestamp_ms = int(time.time() * 1000)
 
-        # For signing: strip query params and prepend /trade-api/v2
-        path_for_signing = endpoint.split('?')[0]  # Remove query params
-        path_for_signing = f"/trade-api/v2{path_for_signing}"  # Add API prefix
-
-        self.logger.info(f"Request URL: {url}")
-        self.logger.info(f"Timestamp (ms): {timestamp_ms} ({len(str(timestamp_ms))} digits)")
-        self.logger.info(f"Signing path: {path_for_signing}")
+        self.logger.error(f"DEBUG - URL: {url}")
+        self.logger.error(f"DEBUG - Signing: {timestamp_ms}{method.upper()}{path_for_signing}")
         signature = self._sign_request(method.upper(), path_for_signing, timestamp_ms)
 
         headers = {
