@@ -1,5 +1,6 @@
 import argparse
 import logging
+from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, Future
 import yaml
 from dotenv import load_dotenv
@@ -8,6 +9,14 @@ import time
 from typing import Dict, List, Set
 
 from mm import KalshiTradingAPI, AvellanedaMarketMaker
+
+
+def cleanup_logger(logger: logging.Logger):
+    """Properly close and remove all handlers from a logger to prevent resource leaks."""
+    handlers = logger.handlers[:]
+    for handler in handlers:
+        handler.close()
+        logger.removeHandler(handler)
 
 # Global logger for the runner
 logging.basicConfig(
@@ -62,19 +71,26 @@ def run_market_for_duration(
     logger = logging.getLogger(f"MM_{market_ticker}")
     logger.setLevel(logging.INFO)
 
-    # Add handlers if not already present
-    if not logger.handlers:
-        fh = logging.FileHandler(f"{market_ticker}.log")
-        fh.setLevel(logging.INFO)
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        fh.setFormatter(formatter)
-        ch.setFormatter(formatter)
-        logger.addHandler(fh)
-        logger.addHandler(ch)
+    # Clean up any existing handlers first to prevent accumulation
+    cleanup_logger(logger)
+
+    # Use RotatingFileHandler to limit log file sizes (5MB max, keep 2 backups)
+    fh = RotatingFileHandler(
+        f"{market_ticker}.log",
+        maxBytes=5*1024*1024,  # 5MB
+        backupCount=2
+    )
+    fh.setLevel(logging.INFO)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
 
     logger.info(f"Starting market maker for {market_ticker}")
+    api = None
 
     try:
         api = create_api(api_key, private_key, base_url, market_ticker, logger)
@@ -89,10 +105,13 @@ def run_market_for_duration(
     except Exception as e:
         logger.error(f"Error running market maker for {market_ticker}: {e}")
     finally:
-        try:
-            api.logout()
-        except:
-            pass
+        if api:
+            try:
+                api.logout()
+            except:
+                pass
+        # Clean up logger handlers to release file descriptors
+        cleanup_logger(logger)
 
     logger.info(f"Market maker for {market_ticker} finished")
 
@@ -271,11 +290,17 @@ def run_dynamic_strategies(config: Dict):
                     active_tickers = fetch_active_markets(series_list, api_key, private_key, base_url)
                 runner_logger.info(f"Found {len(active_tickers)} active markets")
 
-                # Clean up completed futures
+                # Clean up completed futures and check for exceptions
                 completed = [ticker for ticker, future in active_futures.items() if future.done()]
                 for ticker in completed:
+                    future = active_futures[ticker]
+                    try:
+                        # Check for exceptions (this will raise if the future had an error)
+                        future.result(timeout=0)
+                        runner_logger.info(f"Market maker for {ticker} completed successfully")
+                    except Exception as e:
+                        runner_logger.warning(f"Market maker for {ticker} completed with error: {e}")
                     del active_futures[ticker]
-                    runner_logger.info(f"Market maker for {ticker} completed")
 
                 # Start market makers for new markets (up to max_concurrent)
                 for ticker in active_tickers:
@@ -312,16 +337,23 @@ def run_static_strategy(config_name: str, config: Dict):
     logger = logging.getLogger(f"Strategy_{config_name}")
     logger.setLevel(config.get('log_level', 'INFO'))
 
-    if not logger.handlers:
-        fh = logging.FileHandler(f"{config_name}.log")
-        fh.setLevel(config.get('log_level', 'INFO'))
-        ch = logging.StreamHandler()
-        ch.setLevel(config.get('log_level', 'INFO'))
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        fh.setFormatter(formatter)
-        ch.setFormatter(formatter)
-        logger.addHandler(fh)
-        logger.addHandler(ch)
+    # Clean up any existing handlers first to prevent accumulation
+    cleanup_logger(logger)
+
+    # Use RotatingFileHandler to limit log file sizes (5MB max, keep 2 backups)
+    fh = RotatingFileHandler(
+        f"{config_name}.log",
+        maxBytes=5*1024*1024,  # 5MB
+        backupCount=2
+    )
+    fh.setLevel(config.get('log_level', 'INFO'))
+    ch = logging.StreamHandler()
+    ch.setLevel(config.get('log_level', 'INFO'))
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
 
     logger.info(f"Starting strategy: {config_name}")
 

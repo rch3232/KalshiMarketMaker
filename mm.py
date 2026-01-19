@@ -87,6 +87,14 @@ class KalshiTradingAPI(AbstractTradingAPI):
             backend=default_backend()
         )
         self.logger.info(f"RSA private key loaded successfully")
+
+        # Use a session for connection pooling to reduce memory overhead
+        self.session = requests.Session()
+        # Configure connection pool size (default is 10, we keep it small for memory)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=5)
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
+
         self.logger.info(f"API initialized for market: {market_ticker}")
 
     def test_connection(self) -> bool:
@@ -236,11 +244,11 @@ class KalshiTradingAPI(AbstractTradingAPI):
         response = None
         try:
             if method.upper() == "GET":
-                response = requests.get(url, headers=headers, timeout=30)
+                response = self.session.get(url, headers=headers, timeout=30)
             elif method.upper() == "POST":
-                response = requests.post(url, headers=headers, json=data, timeout=30)
+                response = self.session.post(url, headers=headers, json=data, timeout=30)
             elif method.upper() == "DELETE":
-                response = requests.delete(url, headers=headers, timeout=30)
+                response = self.session.delete(url, headers=headers, timeout=30)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
 
@@ -264,8 +272,12 @@ class KalshiTradingAPI(AbstractTradingAPI):
             raise
 
     def logout(self):
-        """No logout needed for API key auth."""
-        self.logger.info("Session ended (API key auth - no logout required)")
+        """Clean up session resources."""
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.logger.info("Session ended (connection pool closed)")
 
     def get_position(self) -> int:
         self.logger.info("Retrieving position...")
@@ -369,19 +381,21 @@ class KalshiTradingAPI(AbstractTradingAPI):
             self.logger.error(f"Failed to fetch markets for series {series_ticker}: {e}")
             raise
 
-    def get_active_markets_by_category(self, category: str = "Sports") -> List[Dict]:
-        """Get all open markets for a category (e.g., 'Sports').
+    def get_active_markets_by_category(self, category: str = "Sports", max_markets: int = 500) -> List[Dict]:
+        """Get open markets for a category (e.g., 'Sports').
 
-        This method fetches ALL sports markets at once without needing to know
-        specific series tickers in advance. It handles pagination to get all results.
+        This method fetches sports markets without needing to know specific series
+        tickers in advance. It handles pagination with a configurable limit.
 
         Args:
             category: The market category to fetch (default: "Sports")
+            max_markets: Maximum number of markets to fetch to prevent unbounded memory
+                        usage (default: 500). Set to 0 for unlimited.
 
         Returns:
             List of market dictionaries containing ticker, title, and other market info
         """
-        self.logger.info(f"Fetching all markets for category: {category}")
+        self.logger.info(f"Fetching markets for category: {category} (max: {max_markets if max_markets else 'unlimited'})")
         all_markets = []
         cursor = None
 
@@ -395,6 +409,12 @@ class KalshiTradingAPI(AbstractTradingAPI):
                 response = self._make_request("GET", endpoint)
                 markets = response.get("markets", [])
                 all_markets.extend(markets)
+
+                # Check if we've hit the max limit
+                if max_markets and len(all_markets) >= max_markets:
+                    all_markets = all_markets[:max_markets]
+                    self.logger.info(f"Reached max_markets limit ({max_markets}), stopping pagination")
+                    break
 
                 # Check for pagination cursor
                 cursor = response.get("cursor")
