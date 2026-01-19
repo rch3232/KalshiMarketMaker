@@ -5,7 +5,7 @@ import base64
 import requests
 import json
 import threading
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List, Tuple, Set, Optional
 import logging
 import uuid
 import math
@@ -1230,7 +1230,7 @@ class AvellanedaMarketMaker:
 
     def compute_tick_aware_quotes(self, yes_mid: float, q: int, t: float,
                                    market_yes_bid: float = 0, market_no_bid: float = 0,
-                                   market_yes_ask: float = 1.0, market_no_ask: float = 1.0) -> Tuple[float, float]:
+                                   market_yes_ask: float = 1.0, market_no_ask: float = 1.0) -> Tuple[Optional[float], Optional[float]]:
         """Compute bid prices based on market tick size.
 
         Pricing Strategy:
@@ -1238,7 +1238,8 @@ class AvellanedaMarketMaker:
         - If min_tick_size < 0.01 (half cent): Set bid 0.5 cents below mid (1 cent spread)
 
         Returns:
-            Tuple of (yes_bid_price, no_bid_price)
+            Tuple of (yes_bid_price, no_bid_price) - None if we can't place that side
+            without crossing the ask (post-only protection)
         """
         no_mid = 1 - yes_mid
 
@@ -1299,19 +1300,37 @@ class AvellanedaMarketMaker:
         # POST-ONLY PROTECTION: Ensure bid < ask to prevent crossing rejection
         # Kalshi rejects post_only orders that would immediately fill (400 error)
         tick = self.min_tick_size if self.min_tick_size else 0.01
+        min_price = 0.02  # Minimum valid price on Kalshi
+
         if market_yes_ask > 0 and yes_bid >= market_yes_ask:
-            # Our bid would cross - set it one tick below ask
-            yes_bid = market_yes_ask - tick
-            yes_bid = max(0.02, round(yes_bid / tick) * tick)  # Round to tick and clamp
-            self.logger.info(f"POST-ONLY PROTECTION: YES bid would cross ask ${market_yes_ask:.3f}, "
-                           f"reduced to ${yes_bid:.3f}")
+            # Our bid would cross - try to set it one tick below ask
+            adjusted_bid = market_yes_ask - tick
+            adjusted_bid = round(adjusted_bid / tick) * tick  # Round to tick
+
+            if adjusted_bid < min_price:
+                # Can't place a valid order below the ask - skip this side
+                self.logger.info(f"POST-ONLY SKIP: YES ask ${market_yes_ask:.3f} too low, "
+                               f"cannot bid below without going under minimum ${min_price:.2f}")
+                yes_bid = None
+            else:
+                yes_bid = adjusted_bid
+                self.logger.info(f"POST-ONLY PROTECTION: YES bid would cross ask ${market_yes_ask:.3f}, "
+                               f"reduced to ${yes_bid:.3f}")
 
         if market_no_ask > 0 and no_bid >= market_no_ask:
-            # Our bid would cross - set it one tick below ask
-            no_bid = market_no_ask - tick
-            no_bid = max(0.02, round(no_bid / tick) * tick)  # Round to tick and clamp
-            self.logger.info(f"POST-ONLY PROTECTION: NO bid would cross ask ${market_no_ask:.3f}, "
-                           f"reduced to ${no_bid:.3f}")
+            # Our bid would cross - try to set it one tick below ask
+            adjusted_bid = market_no_ask - tick
+            adjusted_bid = round(adjusted_bid / tick) * tick  # Round to tick
+
+            if adjusted_bid < min_price:
+                # Can't place a valid order below the ask - skip this side
+                self.logger.info(f"POST-ONLY SKIP: NO ask ${market_no_ask:.3f} too low, "
+                               f"cannot bid below without going under minimum ${min_price:.2f}")
+                no_bid = None
+            else:
+                no_bid = adjusted_bid
+                self.logger.info(f"POST-ONLY PROTECTION: NO bid would cross ask ${market_no_ask:.3f}, "
+                               f"reduced to ${no_bid:.3f}")
 
         return yes_bid, no_bid
 
@@ -1389,7 +1408,7 @@ class AvellanedaMarketMaker:
         except Exception as e:
             self.logger.warning(f"Failed to sync tracked orders: {e}")
 
-    def reconcile_orders(self, desired_yes_price: float, desired_no_price: float,
+    def reconcile_orders(self, desired_yes_price: Optional[float], desired_no_price: Optional[float],
                          desired_count: int = 1, position: int = 0) -> None:
         """Reconcile current orders with desired state (Desired State Engine).
 
@@ -1401,8 +1420,8 @@ class AvellanedaMarketMaker:
         4. If price is different AND order age < MIN_AGE: Wait (don't jump out of line)
 
         Args:
-            desired_yes_price: Target YES bid price
-            desired_no_price: Target NO bid price
+            desired_yes_price: Target YES bid price (None = skip/cancel this side)
+            desired_no_price: Target NO bid price (None = skip/cancel this side)
             desired_count: Desired order quantity (default 1)
             position: Current inventory position
         """
@@ -1430,6 +1449,10 @@ class AvellanedaMarketMaker:
         if yes_blocked:
             self.logger.info(f"CROSS-MARKET CONFLICT: YES buys blocked on {self.market_ticker}")
             self._cancel_side_if_exists('yes')
+        elif desired_yes_price is None:
+            # Post-only protection: can't bid without crossing ask
+            self.logger.info(f"POST-ONLY SKIP: Cannot place YES bid (would cross ask), canceling")
+            self._cancel_side_if_exists('yes')
         elif position < position_limit:
             self._reconcile_side('yes', desired_yes_price, desired_count, expiration_ts, current_time)
         else:
@@ -1440,6 +1463,10 @@ class AvellanedaMarketMaker:
         # Process NO side
         if no_blocked:
             self.logger.info(f"CROSS-MARKET CONFLICT: NO buys blocked on {self.market_ticker}")
+            self._cancel_side_if_exists('no')
+        elif desired_no_price is None:
+            # Post-only protection: can't bid without crossing ask
+            self.logger.info(f"POST-ONLY SKIP: Cannot place NO bid (would cross ask), canceling")
             self._cancel_side_if_exists('no')
         elif position > -position_limit:
             self._reconcile_side('no', desired_no_price, desired_count, expiration_ts, current_time)
@@ -1908,24 +1935,27 @@ class AvellanedaMarketMaker:
             if q != 0:
                 self.logger.debug(f"Position: {q}, continuing with market-based pricing (no cost constraint)")
 
-            # Log market state
+            # Log market state (handle None prices from post-only protection)
+            def fmt_price(p, decimals=2):
+                return f"${p:.{decimals}f}" if p is not None else "SKIP"
+
             if self.use_subpenny:
                 self.logger.info(f"Market: YES mid=${yes_mid:.3f}, NO mid=${no_mid:.3f} (sub-penny)")
                 if exit_status == 'dual_exit':
                     # In dual exit, show which side we're bidding on
                     opposite_side = 'NO' if self.pending_exit and self.pending_exit['side'] == 'yes' else 'YES'
                     bid_price = no_bid if opposite_side == 'NO' else yes_bid
-                    self.logger.info(f"Position: {q} | DUAL EXIT: Selling owned + BUY {opposite_side} @${bid_price:.3f}")
+                    self.logger.info(f"Position: {q} | DUAL EXIT: Selling owned + BUY {opposite_side} @{fmt_price(bid_price, 3)}")
                 else:
-                    self.logger.info(f"Position: {q} | Desired: BUY YES @${yes_bid:.3f}, BUY NO @${no_bid:.3f}")
+                    self.logger.info(f"Position: {q} | Desired: BUY YES @{fmt_price(yes_bid, 3)}, BUY NO @{fmt_price(no_bid, 3)}")
             else:
                 self.logger.info(f"Market: YES mid=${yes_mid:.2f}, NO mid=${no_mid:.2f}")
                 if exit_status == 'dual_exit':
                     opposite_side = 'NO' if self.pending_exit and self.pending_exit['side'] == 'yes' else 'YES'
                     bid_price = no_bid if opposite_side == 'NO' else yes_bid
-                    self.logger.info(f"Position: {q} | DUAL EXIT: Selling owned + BUY {opposite_side} @${bid_price:.2f}")
+                    self.logger.info(f"Position: {q} | DUAL EXIT: Selling owned + BUY {opposite_side} @{fmt_price(bid_price)}")
                 else:
-                    self.logger.info(f"Position: {q} | Desired: BUY YES @${yes_bid:.2f}, BUY NO @${no_bid:.2f}")
+                    self.logger.info(f"Position: {q} | Desired: BUY YES @{fmt_price(yes_bid)}, BUY NO @{fmt_price(no_bid)}")
 
             # DESIRED STATE ENGINE: Reconcile orders instead of cancel-and-replace
             # In dual exit mode, only reconcile the opposite side (don't touch the sell order)
@@ -1937,8 +1967,6 @@ class AvellanedaMarketMaker:
                 opposite_side = 'no' if owned_side == 'yes' else 'yes'
                 opposite_price = no_bid if opposite_side == 'no' else yes_bid
 
-                self.logger.info(f"DUAL EXIT MODE: Synced orders, placing {opposite_side.upper()} bid @ ${opposite_price:.2f}")
-
                 # CRITICAL: Cancel any BUY orders on the OWNED side
                 # This ensures we don't have both SELL and BUY on the same side
                 # (BUY orders may linger from before entering dual exit mode)
@@ -1947,7 +1975,13 @@ class AvellanedaMarketMaker:
                     self._cancel_side_if_exists(owned_side)
 
                 # Only reconcile opposite side - the owned side has a SELL order, not a BUY
-                self._reconcile_side(opposite_side, opposite_price, 1, int(time.time()) + self.order_expiration, time.time())
+                # If opposite_price is None (post-only protection), cancel that side instead
+                if opposite_price is None:
+                    self.logger.info(f"DUAL EXIT MODE: Cannot place {opposite_side.upper()} bid (would cross ask), canceling")
+                    self._cancel_side_if_exists(opposite_side)
+                else:
+                    self.logger.info(f"DUAL EXIT MODE: Synced orders, placing {opposite_side.upper()} bid @ ${opposite_price:.2f}")
+                    self._reconcile_side(opposite_side, opposite_price, 1, int(time.time()) + self.order_expiration, time.time())
             else:
                 # Normal mode: reconcile both sides
                 self.reconcile_orders(yes_bid, no_bid, desired_count=1, position=q)
