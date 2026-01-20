@@ -17,11 +17,12 @@ def is_parlay_or_combo_market(market: Dict) -> tuple[bool, str]:
     This filters out actual parlay/combo markets while allowing spread markets
     (like "Indiana wins by over 7.5 points") which are valid binary markets.
 
+    Uses only API-provided metadata flags which are reliable. Removed the
+    comma-based heuristic which was too aggressive and blocked legitimate markets.
+
     Returns:
         tuple of (should_skip: bool, reason: str)
     """
-    ticker = market.get('ticker', '')
-
     # Check 1: is_multivariate metadata flag - most reliable way to spot combos
     if market.get('is_multivariate') is True:
         return True, "is_multivariate=True"
@@ -30,13 +31,9 @@ def is_parlay_or_combo_market(market: Dict) -> tuple[bool, str]:
     if market.get('is_combo') is True:
         return True, "is_combo=True"
 
-    # Check 3: Ticker format - more than one comma indicates parlay
-    # Single markets may have one comma for specific outcomes, parlays use many
-    comma_count = ticker.count(',')
-    if comma_count > 1:
-        return True, f"ticker contains {comma_count} commas (parlay indicator)"
-
-    # Check 4: market_type must be 'binary'
+    # Check 3: market_type must be 'binary'
+    # Note: Removed comma-based heuristic - it was blocking legitimate spread markets
+    # The API flags above are sufficient and more accurate
     market_type = market.get('market_type', '')
     if market_type != 'binary':
         return True, f"market_type is '{market_type}', not 'binary'"

@@ -106,6 +106,9 @@ class SharedPositionTracker:
                 positions_by_event[event_prefix] = []
             positions_by_event[event_prefix].append((ticker, pos_data['side']))
 
+        # Track previous blocks to detect NEW blocks (avoid repeated logging)
+        previous_blocks = {k: v.copy() for k, v in self._blocked_sides.items()}
+
         # Clear existing blocks
         self._blocked_sides.clear()
 
@@ -122,8 +125,14 @@ class SharedPositionTracker:
                         if other_ticker not in self._blocked_sides:
                             self._blocked_sides[other_ticker] = set()
                         self._blocked_sides[other_ticker].add(side)
-                        self._logger.debug(f"Blocked {side.upper()} buys on {other_ticker} "
-                                          f"(conflict with {ticker})")
+
+        # Log only NEW blocks (ones that weren't in previous_blocks)
+        for ticker, blocked_sides in self._blocked_sides.items():
+            prev = previous_blocks.get(ticker, set())
+            for side in blocked_sides:
+                if side not in prev:
+                    self._logger.warning(f"CONFLICT: Blocking {side.upper()} buys on {ticker} "
+                                        f"(cross-market position conflict)")
 
     def is_buy_blocked(self, ticker: str, side: str) -> bool:
         """Check if buying a specific side is blocked due to cross-market conflict.
@@ -138,10 +147,9 @@ class SharedPositionTracker:
         with self._lock:
             blocked = self._blocked_sides.get(ticker, set())
             is_blocked = side.lower() in blocked
-
-            if is_blocked:
-                self._logger.warning(f"BUY {side.upper()} blocked on {ticker} - "
-                                    f"would create cross-market conflict")
+            # Note: Don't log here - this is called every cycle (every 2s).
+            # Logging happens once when blocks are established in _recalculate_blocks()
+            # and when the market maker acts on it in _manage_order().
             return is_blocked
 
     def get_conflicts(self) -> List[Dict]:
@@ -1155,6 +1163,9 @@ class AvellanedaMarketMaker:
         self.yes_quantity = 0      # Number of YES contracts held
         self.no_quantity = 0       # Number of NO contracts held
 
+        # Track which cross-market blocks have been logged (avoid repeated logging)
+        self._logged_blocks = set()  # Contains 'yes' and/or 'no'
+
     def compute_reservation_price(self, mid_price: float, q: int, t: float) -> float:
         """Compute reservation price with inventory adjustment.
 
@@ -1862,9 +1873,23 @@ class AvellanedaMarketMaker:
         yes_blocked = self.position_tracker.is_buy_blocked(self.market_ticker, 'yes')
         no_blocked = self.position_tracker.is_buy_blocked(self.market_ticker, 'no')
 
+        # Update logged blocks tracking (log once when block starts, clear when block ends)
+        if yes_blocked and 'yes' not in self._logged_blocks:
+            self.logger.warning(f"CROSS-MARKET CONFLICT: YES buys blocked on {self.market_ticker}")
+            self._logged_blocks.add('yes')
+        elif not yes_blocked and 'yes' in self._logged_blocks:
+            self.logger.info(f"CROSS-MARKET CONFLICT CLEARED: YES buys now allowed on {self.market_ticker}")
+            self._logged_blocks.discard('yes')
+
+        if no_blocked and 'no' not in self._logged_blocks:
+            self.logger.warning(f"CROSS-MARKET CONFLICT: NO buys blocked on {self.market_ticker}")
+            self._logged_blocks.add('no')
+        elif not no_blocked and 'no' in self._logged_blocks:
+            self.logger.info(f"CROSS-MARKET CONFLICT CLEARED: NO buys now allowed on {self.market_ticker}")
+            self._logged_blocks.discard('no')
+
         # Process YES side
         if yes_blocked:
-            self.logger.info(f"CROSS-MARKET CONFLICT: YES buys blocked on {self.market_ticker}")
             self._cancel_side_if_exists('yes')
         elif desired_yes_price is None:
             # Post-only protection: can't bid without crossing ask
@@ -1879,7 +1904,6 @@ class AvellanedaMarketMaker:
 
         # Process NO side
         if no_blocked:
-            self.logger.info(f"CROSS-MARKET CONFLICT: NO buys blocked on {self.market_ticker}")
             self._cancel_side_if_exists('no')
         elif desired_no_price is None:
             # Post-only protection: can't bid without crossing ask

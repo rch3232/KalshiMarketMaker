@@ -59,12 +59,12 @@ max_concurrent_markets: 75
 liquidity_filter:
   # Minimum 24h volume required (0 = disabled)
   # Only applies to regular markets - incentive markets bypass this check
-  min_volume: 500
+  min_volume: 3000
 
   # Maximum bid-ask spread in cents
   # Markets with spreads wider than this are skipped (likely illiquid)
-  # 25 = skip if spread > 25¢ (balanced for sports markets)
-  max_spread_cents: 25
+  # 5 = only trade tight markets with spread <= 5¢
+  max_spread_cents: 5
 
 # =============================================================================
 # LONG SHOT BIAS FILTER
