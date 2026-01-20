@@ -650,6 +650,110 @@ def fetch_active_markets_by_category(
     return incentive_market_list, regular_market_list
 
 
+def fetch_incentive_markets_directly(
+    incentive_tickers: Set[str],
+    already_discovered: Set[str],
+    api_key: str,
+    private_key: str,
+    base_url: str,
+    longshot_filter_enabled: bool = True,
+    longshot_price_floor: int = 20,
+    longshot_price_ceiling: int = 80,
+) -> List[str]:
+    """Fetch incentive markets that weren't found in the category search.
+
+    This ensures we trade ALL incentive markets (Politics, News, etc.)
+    even when the config is set to category: Sports.
+
+    Args:
+        incentive_tickers: Set of all tickers with active liquidity incentives
+        already_discovered: Set of tickers already discovered from category search
+        api_key: Kalshi API key
+        private_key: Kalshi private key
+        base_url: Kalshi API base URL
+        longshot_filter_enabled: Whether to apply longshot filter
+        longshot_price_floor: Minimum YES price in cents
+        longshot_price_ceiling: Maximum YES price in cents
+
+    Returns:
+        List of additional incentive market tickers to trade
+    """
+    logger = logging.getLogger("IncentiveFetcher")
+    additional_incentive_markets = []
+
+    # Find incentive tickers NOT already discovered
+    missing_incentives = incentive_tickers - already_discovered
+    if not missing_incentives:
+        logger.debug("All incentive markets already discovered via category search")
+        return []
+
+    logger.info(f"Fetching {len(missing_incentives)} incentive markets outside of category...")
+
+    try:
+        temp_api = KalshiTradingAPI(
+            api_key=api_key,
+            private_key=private_key,
+            market_ticker="DUMMY",
+            base_url=base_url,
+            logger=logger
+        )
+
+        skipped_parlay = 0
+        skipped_longshot = 0
+        skipped_closed = 0
+
+        for ticker in missing_incentives:
+            try:
+                market = temp_api.get_market_data(ticker)
+                if not market:
+                    continue
+
+                # Skip if market is not open
+                status = market.get('status', '')
+                if status != 'open':
+                    logger.debug(f"Skipping closed incentive market: {ticker} (status={status})")
+                    skipped_closed += 1
+                    continue
+
+                # Filter out parlay/combo markets
+                is_parlay, reason = is_parlay_or_combo_market(market)
+                if is_parlay:
+                    logger.debug(f"Skipping parlay incentive market: {ticker} - {reason}")
+                    skipped_parlay += 1
+                    continue
+
+                # Apply longshot filter (still applies to incentive markets)
+                if longshot_filter_enabled:
+                    is_safe, longshot_reason = check_longshot_bias(
+                        market, longshot_price_floor, longshot_price_ceiling
+                    )
+                    if not is_safe:
+                        logger.debug(f"Skipping longshot incentive market: {ticker} - {longshot_reason}")
+                        skipped_longshot += 1
+                        continue
+
+                # Market passed filters - add to list
+                title = market.get('title', 'Unknown')
+                subtitle = market.get('subtitle', '')
+                category = market.get('category', 'Unknown')
+                additional_incentive_markets.append(ticker)
+                print(f'Discovered INCENTIVE Market (non-category): {ticker}')
+                logger.info(f"Discovered INCENTIVE market [{category}]: {ticker} - {title} {subtitle}".strip())
+
+            except Exception as e:
+                logger.warning(f"Failed to fetch incentive market {ticker}: {e}")
+
+        temp_api.logout()
+
+        logger.info(f"Additional incentive markets found: {len(additional_incentive_markets)} "
+                   f"(skipped {skipped_closed} closed, {skipped_parlay} parlays, {skipped_longshot} longshots)")
+
+    except Exception as e:
+        logger.error(f"Failed to fetch incentive markets directly: {e}")
+
+    return additional_incentive_markets
+
+
 def run_dynamic_strategies(config: Dict):
     """
     Main loop that:
@@ -773,6 +877,25 @@ def run_dynamic_strategies(config: Dict):
                     )
                     incentive_discovered = []
                     regular_discovered = discovered_tickers
+
+                # STEP 3.5: Fetch incentive markets that weren't in the category
+                # This ensures we trade ALL incentive markets (Politics, News, etc.)
+                # even when category is set to Sports
+                if incentives_enabled and incentive_tickers:
+                    already_discovered = set(discovered_tickers) | position_tickers
+                    additional_incentives = fetch_incentive_markets_directly(
+                        incentive_tickers=incentive_tickers,
+                        already_discovered=already_discovered,
+                        api_key=api_key,
+                        private_key=private_key,
+                        base_url=base_url,
+                        longshot_filter_enabled=longshot_enabled,
+                        longshot_price_floor=longshot_price_floor,
+                        longshot_price_ceiling=longshot_price_ceiling,
+                    )
+                    if additional_incentives:
+                        runner_logger.info(f"Found {len(additional_incentives)} additional incentive markets outside {category or 'series'} category")
+                        incentive_discovered.extend(additional_incentives)
 
                 # STEP 4: Combine with priority order:
                 # 1. Position markets (highest - must manage existing positions)

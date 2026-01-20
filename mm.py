@@ -63,9 +63,30 @@ class SharedPositionTracker:
         e.g., KXFIGHT-19JAN26-LASERNA-ARIAS-LASERNA
 
         We extract everything before the last dash as the event prefix.
+
+        EXCEPTION: Spread markets end with numeric values (-10, -20, etc.)
+        and are NOT mutually exclusive. For these, we use the full ticker
+        as the prefix so they're treated as independent markets.
+
+        Examples:
+        - KXFIGHT-19JAN26-LASERNA-ARIAS-LASERNA -> prefix: KXFIGHT-19JAN26-LASERNA-ARIAS
+        - KXFIGHT-19JAN26-LASERNA-ARIAS-ARIAS   -> prefix: KXFIGHT-19JAN26-LASERNA-ARIAS
+          (These share a prefix, so cross-market conflict applies)
+
+        - KXNFLRSHYDS-26JAN25LASEA-LAMSTAFFORD9-10 -> prefix: (full ticker)
+        - KXNFLRSHYDS-26JAN25LASEA-LAMSTAFFORD9-20 -> prefix: (full ticker)
+          (Numeric endings = spread markets, no cross-market conflict between them)
         """
         parts = ticker.rsplit('-', 1)
         if len(parts) == 2:
+            # Check if the last segment is numeric (spread line)
+            # Spread lines can be positive (10, 20) or negative representations
+            # Also handle decimal spreads like "7.5" -> "75" after decimal removal
+            last_segment = parts[1].replace('.', '')  # Handle "7.5" -> "75"
+            if last_segment.isdigit():
+                # This is a spread market - use full ticker as prefix
+                # so each spread line is treated independently
+                return ticker
             return parts[0]
         return ticker  # No dash found, use whole ticker
 
@@ -749,6 +770,27 @@ class KalshiTradingAPI(AbstractTradingAPI):
         except Exception as e:
             self.logger.error(f"Failed to get market info: {e}")
             raise
+
+    def get_market_data(self, ticker: str) -> Dict:
+        """Get full market data for a specific ticker.
+
+        Returns the market dict in the same format as category/series queries,
+        suitable for filter checks (parlay, liquidity, longshot).
+
+        Args:
+            ticker: Market ticker to fetch
+
+        Returns:
+            Dict with market data including yes_bid, yes_ask, volume, etc.
+        """
+        self.logger.debug(f"Fetching market data for {ticker}...")
+        try:
+            response = self._make_request("GET", f"/markets/{ticker}")
+            market = response.get("market", {})
+            return market
+        except Exception as e:
+            self.logger.warning(f"Failed to get market data for {ticker}: {e}")
+            return {}
 
     def decrease_order(self, order_id: str, reduce_by: int) -> bool:
         """Decrease an order's quantity without losing queue priority.
@@ -1895,11 +1937,11 @@ class AvellanedaMarketMaker:
             # Post-only protection: can't bid without crossing ask
             self.logger.info(f"POST-ONLY SKIP: Cannot place YES bid (would cross ask), canceling")
             self._cancel_side_if_exists('yes')
-        elif position < position_limit:
+        elif position <= position_limit:
             self._reconcile_side('yes', desired_yes_price, desired_count, expiration_ts, current_time)
         else:
             # At position limit - cancel any YES orders
-            self.logger.info(f"POSITION LIMIT: position={position} >= limit={position_limit}, skipping YES orders")
+            self.logger.info(f"POSITION LIMIT: position={position} > limit={position_limit}, skipping YES orders")
             self._cancel_side_if_exists('yes')
 
         # Process NO side
@@ -1909,11 +1951,11 @@ class AvellanedaMarketMaker:
             # Post-only protection: can't bid without crossing ask
             self.logger.info(f"POST-ONLY SKIP: Cannot place NO bid (would cross ask), canceling")
             self._cancel_side_if_exists('no')
-        elif position > -position_limit:
+        elif position >= -position_limit:
             self._reconcile_side('no', desired_no_price, desired_count, expiration_ts, current_time)
         else:
             # At position limit - cancel any NO orders
-            self.logger.info(f"POSITION LIMIT: position={position} <= -{position_limit}, skipping NO orders")
+            self.logger.info(f"POSITION LIMIT: position={position} < -{position_limit}, skipping NO orders")
             self._cancel_side_if_exists('no')
 
     def _reconcile_side(self, side: str, desired_price: float, desired_count: int,
