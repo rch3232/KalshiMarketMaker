@@ -677,6 +677,9 @@ class KalshiTradingAPI(AbstractTradingAPI):
             order_id = response.get("order", {}).get("order_id")
             self.logger.info(f"Placed {action} order (post_only), order ID: {order_id}")
             return str(order_id)
+        except MarketNotFoundError:
+            # Don't double-log - _make_request already logged the details
+            raise
         except Exception as e:
             self.logger.error(f"Failed to place order: {e}")
             raise
@@ -688,6 +691,9 @@ class KalshiTradingAPI(AbstractTradingAPI):
             success = response.get("reduced_by", 0) > 0
             self.logger.info(f"Canceled order with ID {order_id}, success: {success}")
             return success
+        except MarketNotFoundError:
+            # Don't double-log - _make_request already logged the details
+            raise
         except Exception as e:
             self.logger.error(f"Failed to cancel order: {e}")
             raise
@@ -819,8 +825,57 @@ class KalshiTradingAPI(AbstractTradingAPI):
             order_id = response.get("order", {}).get("order_id")
             self.logger.info(f"Placed {action} order (post_only), order ID: {order_id}")
             return str(order_id)
+        except MarketNotFoundError:
+            # Don't double-log - _make_request already logged the details
+            raise
         except Exception as e:
             self.logger.error(f"Failed to place order: {e}")
+            raise
+
+    def place_taker_order(self, action: str, side: str, price: float, quantity: int) -> str:
+        """Place a taker order (IOC - immediate or cancel, no post_only).
+
+        Used when we want to immediately take liquidity at the market price
+        rather than resting a maker order. This incurs taker fees (up to 2¢)
+        but provides immediate execution.
+
+        Args:
+            action: 'buy' or 'sell'
+            side: 'yes' or 'no'
+            price: Limit price (protection against slippage)
+            quantity: Number of contracts
+
+        Returns:
+            Order ID as string
+        """
+        self.logger.info(f"Placing TAKER {action} order for {side} side at ${price:.2f} with quantity {quantity}...")
+        try:
+            price_cents = int(price * 100)
+
+            order_data = {
+                "ticker": self.market_ticker,
+                "action": action.lower(),
+                "type": "limit",
+                "side": side,
+                "count": quantity,
+                "client_order_id": str(uuid.uuid4()),
+                # No post_only - allow immediate match (taker)
+            }
+
+            if side == "yes":
+                order_data["yes_price"] = price_cents
+            else:
+                order_data["no_price"] = price_cents
+
+            response = self._make_request("POST", "/portfolio/orders", order_data)
+            order_id = response.get("order", {}).get("order_id")
+            self.logger.info(f"Placed TAKER {action} order, order ID: {order_id}")
+            return str(order_id)
+        except MarketNotFoundError:
+            # Don't double-log - _make_request already logged the details
+            raise
+        except Exception as e:
+            self.logger.error(f"Failed to place taker order: {e}")
             raise
 
     def get_active_markets_by_series(self, series_ticker: str) -> List[Dict]:
@@ -1428,6 +1483,150 @@ class AvellanedaMarketMaker:
             self.no_quantity = 0
         self.logger.debug(f"Cost basis reset for {side or 'all'}")
 
+    # Taker fee constant (Kalshi charges up to 2 cents per contract for takers)
+    TAKER_FEE = 0.02
+    # Minimum improvement threshold to take liquidity (after accounting for fees)
+    TAKER_IMPROVEMENT_THRESHOLD = 0.02
+
+    def check_and_execute_taker_opportunity(
+        self,
+        position: int,
+        market_yes_bid: float,
+        market_yes_ask: float,
+        market_no_bid: float,
+        market_no_ask: float
+    ) -> Optional[str]:
+        """Check if taking liquidity would be better than resting orders.
+
+        Fee-aware taker optimization:
+        - For SELLING (when we own contracts): If the taker price (after 2¢ fee)
+          gives us 2¢+ more than our resting sell order, take the bid.
+        - For BUYING (when we have resting buys): If the taker price (after 2¢ fee)
+          costs us 2¢+ less than our resting buy order, take the ask.
+
+        The math:
+        - Selling: if (market_bid - 2¢ fee) >= (resting_sell + 2¢ improvement)
+                   => market_bid >= resting_sell + 4¢
+        - Buying:  if (market_ask + 2¢ fee) <= (resting_buy - 2¢ improvement)
+                   => market_ask <= resting_buy - 4¢
+
+        Returns:
+            'took_yes_bid' - Took the YES bid (sold YES)
+            'took_no_bid' - Took the NO bid (sold NO)
+            'took_yes_ask' - Took the YES ask (bought YES)
+            'took_no_ask' - Took the NO ask (bought NO)
+            None - No taker opportunity worth taking
+        """
+        threshold = self.TAKER_FEE + self.TAKER_IMPROVEMENT_THRESHOLD  # 4¢ total
+
+        # Check SELL opportunities (when we own contracts)
+        if position > 0 and self.yes_cost_basis > 0:
+            # We own YES contracts - check if we should sell by taking the bid
+            yes_tracked = self.tracked_orders.get('yes')
+
+            # Check if we have an active sell order (exit order) or a resting position we want to exit
+            # In dual exit mode, we have a sell order - check if taker is better
+            if self.in_dual_exit_mode and self.active_exit_order_id:
+                # We have a resting sell order - compare to taker opportunity
+                # Get our current sell price from the exit order context
+                if self.pending_exit and 'cost_basis' in self.pending_exit:
+                    our_sell_price = self.pending_exit['cost_basis'] + 0.01  # Our target exit
+                    # Taker net = market_bid - fee
+                    taker_net = market_yes_bid - self.TAKER_FEE
+                    improvement = taker_net - our_sell_price
+
+                    if improvement >= self.TAKER_IMPROVEMENT_THRESHOLD and market_yes_bid > 0:
+                        self.logger.info(
+                            f"TAKER OPPORTUNITY (SELL YES): market bid ${market_yes_bid:.2f} - "
+                            f"fee ${self.TAKER_FEE:.2f} = ${taker_net:.2f} net, "
+                            f"vs resting ~${our_sell_price:.2f} -> +${improvement:.2f} improvement!"
+                        )
+                        try:
+                            # Cancel the resting sell order
+                            self.api.cancel_order(self.active_exit_order_id)
+                            # Take the bid
+                            self.api.place_taker_order("sell", "yes", market_yes_bid, abs(position))
+                            # Clear exit state since we sold
+                            self.pending_exit = None
+                            self.active_exit_order_id = None
+                            self.in_dual_exit_mode = False
+                            return 'took_yes_bid'
+                        except Exception as e:
+                            self.logger.error(f"Failed to execute taker sell YES: {e}")
+
+        elif position < 0 and self.no_cost_basis > 0:
+            # We own NO contracts - check if we should sell by taking the bid
+            if self.in_dual_exit_mode and self.active_exit_order_id:
+                if self.pending_exit and 'cost_basis' in self.pending_exit:
+                    our_sell_price = self.pending_exit['cost_basis'] + 0.01
+                    taker_net = market_no_bid - self.TAKER_FEE
+                    improvement = taker_net - our_sell_price
+
+                    if improvement >= self.TAKER_IMPROVEMENT_THRESHOLD and market_no_bid > 0:
+                        self.logger.info(
+                            f"TAKER OPPORTUNITY (SELL NO): market bid ${market_no_bid:.2f} - "
+                            f"fee ${self.TAKER_FEE:.2f} = ${taker_net:.2f} net, "
+                            f"vs resting ~${our_sell_price:.2f} -> +${improvement:.2f} improvement!"
+                        )
+                        try:
+                            self.api.cancel_order(self.active_exit_order_id)
+                            self.api.place_taker_order("sell", "no", market_no_bid, abs(position))
+                            self.pending_exit = None
+                            self.active_exit_order_id = None
+                            self.in_dual_exit_mode = False
+                            return 'took_no_bid'
+                        except Exception as e:
+                            self.logger.error(f"Failed to execute taker sell NO: {e}")
+
+        # Check BUY opportunities (when we have resting buy orders)
+        # Check YES buy opportunity
+        yes_tracked = self.tracked_orders.get('yes')
+        if yes_tracked and yes_tracked.get('price') and market_yes_ask > 0:
+            our_buy_price = yes_tracked['price']
+            # Taker cost = market_ask + fee
+            taker_cost = market_yes_ask + self.TAKER_FEE
+            # Improvement = how much less we'd pay vs resting order
+            improvement = our_buy_price - taker_cost
+
+            if improvement >= self.TAKER_IMPROVEMENT_THRESHOLD:
+                self.logger.info(
+                    f"TAKER OPPORTUNITY (BUY YES): market ask ${market_yes_ask:.2f} + "
+                    f"fee ${self.TAKER_FEE:.2f} = ${taker_cost:.2f} cost, "
+                    f"vs resting buy ${our_buy_price:.2f} -> ${improvement:.2f} savings!"
+                )
+                try:
+                    # Cancel our resting buy order
+                    self.api.cancel_order(yes_tracked['order_id'])
+                    self.tracked_orders['yes'] = None
+                    # Take the ask
+                    self.api.place_taker_order("buy", "yes", market_yes_ask, yes_tracked['count'])
+                    return 'took_yes_ask'
+                except Exception as e:
+                    self.logger.error(f"Failed to execute taker buy YES: {e}")
+
+        # Check NO buy opportunity
+        no_tracked = self.tracked_orders.get('no')
+        if no_tracked and no_tracked.get('price') and market_no_ask > 0:
+            our_buy_price = no_tracked['price']
+            taker_cost = market_no_ask + self.TAKER_FEE
+            improvement = our_buy_price - taker_cost
+
+            if improvement >= self.TAKER_IMPROVEMENT_THRESHOLD:
+                self.logger.info(
+                    f"TAKER OPPORTUNITY (BUY NO): market ask ${market_no_ask:.2f} + "
+                    f"fee ${self.TAKER_FEE:.2f} = ${taker_cost:.2f} cost, "
+                    f"vs resting buy ${our_buy_price:.2f} -> ${improvement:.2f} savings!"
+                )
+                try:
+                    self.api.cancel_order(no_tracked['order_id'])
+                    self.tracked_orders['no'] = None
+                    self.api.place_taker_order("buy", "no", market_no_ask, no_tracked['count'])
+                    return 'took_no_ask'
+                except Exception as e:
+                    self.logger.error(f"Failed to execute taker buy NO: {e}")
+
+        return None
+
     def compute_tick_aware_quotes(self, yes_mid: float, q: int, t: float,
                                    market_yes_bid: float = 0, market_no_bid: float = 0,
                                    market_yes_ask: float = 1.0, market_no_ask: float = 1.0) -> Tuple[Optional[float], Optional[float]]:
@@ -1738,6 +1937,9 @@ class AvellanedaMarketMaker:
                         f"(age: {order_age:.1f}s), canceling and replacing")
         try:
             self.api.cancel_order(tracked['order_id'])
+        except MarketNotFoundError:
+            # Market settled - re-raise to stop market maker
+            raise
         except Exception as e:
             self.logger.warning(f"Failed to cancel {side} order: {e}")
 
@@ -1768,6 +1970,9 @@ class AvellanedaMarketMaker:
             else:
                 self.active_no_order_id = order_id
 
+        except MarketNotFoundError:
+            # Market settled/delisted - re-raise to stop the market maker
+            raise
         except Exception as e:
             self.logger.error(f"Failed to place {side} order at ${price:.3f}: {e}")
 
@@ -1779,6 +1984,10 @@ class AvellanedaMarketMaker:
                 self.api.cancel_order(tracked['order_id'])
                 self.tracked_orders[side] = None
                 self.logger.info(f"Canceled {side.upper()} order (at position limit)")
+            except MarketNotFoundError:
+                # Market settled/delisted - clear tracking and re-raise
+                self.tracked_orders[side] = None
+                raise
             except Exception as e:
                 self.logger.warning(f"Failed to cancel {side} order: {e}")
 
@@ -2043,6 +2252,9 @@ class AvellanedaMarketMaker:
                 )
                 self.in_dual_exit_mode = True
                 return 'dual_exit'
+            except MarketNotFoundError:
+                # Market settled - re-raise to stop market maker
+                raise
             except Exception as e:
                 self.logger.error(f"Failed to place YES exit order: {e}")
                 return 'none'
@@ -2058,6 +2270,9 @@ class AvellanedaMarketMaker:
                 )
                 self.in_dual_exit_mode = True
                 return 'dual_exit'
+            except MarketNotFoundError:
+                # Market settled - re-raise to stop market maker
+                raise
             except Exception as e:
                 self.logger.error(f"Failed to place NO exit order: {e}")
                 return 'none'
@@ -2118,6 +2333,16 @@ class AvellanedaMarketMaker:
 
             # Update the cross-market position tracker
             self.position_tracker.update_position(self.market_ticker, q)
+
+            # Check for taker opportunities BEFORE placing/updating maker orders
+            # This allows us to take liquidity if it's significantly better than resting
+            taker_result = self.check_and_execute_taker_opportunity(
+                q, market_yes_bid, market_yes_ask, market_no_bid, market_no_ask
+            )
+            if taker_result:
+                self.logger.info(f"TAKER EXECUTED: {taker_result}, skipping maker order update this iteration")
+                self.t += dt
+                return  # Skip rest of iteration - position has changed, will reconcile next loop
 
             # Compute tick-aware quotes based on market type
             yes_bid, no_bid = self.compute_tick_aware_quotes(
