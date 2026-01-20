@@ -63,8 +63,8 @@ liquidity_filter:
 
   # Maximum bid-ask spread in cents
   # Markets with spreads wider than this are skipped (likely illiquid)
-  # 15 = skip if spread > 15¢ (allows new markets with moderate spreads)
-  max_spread_cents: 15
+  # 25 = skip if spread > 25¢ (balanced for sports markets)
+  max_spread_cents: 25
 
 # =============================================================================
 # LONG SHOT BIAS FILTER

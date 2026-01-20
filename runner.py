@@ -551,6 +551,8 @@ def fetch_active_markets_by_category(
         skipped_liquidity = 0
         skipped_longshot = 0
         parlay_reasons = {}  # Track breakdown of parlay filter reasons
+        liquidity_reasons = {}  # Track breakdown of liquidity filter reasons
+        longshot_reasons = {}  # Track breakdown of longshot filter reasons
 
         for market in markets:
             ticker = market.get('ticker')
@@ -586,6 +588,9 @@ def fetch_active_markets_by_category(
                 if not is_liquid:
                     logger.debug(f"Skipping illiquid market: {ticker} - {liq_reason}")
                     skipped_liquidity += 1
+                    # Track reason breakdown - extract reason type
+                    reason_key = liq_reason.split('(')[0].strip() if '(' in liq_reason else liq_reason
+                    liquidity_reasons[reason_key] = liquidity_reasons.get(reason_key, 0) + 1
                     continue
 
             # Apply long shot bias filter (20-80 cent range) to all markets including incentive markets
@@ -596,6 +601,13 @@ def fetch_active_markets_by_category(
                 if not is_safe:
                     logger.debug(f"Skipping longshot market: {ticker} - {longshot_reason}")
                     skipped_longshot += 1
+                    # Track reason breakdown
+                    if 'floor' in longshot_reason:
+                        longshot_reasons['below_floor'] = longshot_reasons.get('below_floor', 0) + 1
+                    elif 'ceiling' in longshot_reason:
+                        longshot_reasons['above_ceiling'] = longshot_reasons.get('above_ceiling', 0) + 1
+                    else:
+                        longshot_reasons['other'] = longshot_reasons.get('other', 0) + 1
                     continue
 
             # Market passed all filters - add to appropriate list
@@ -618,9 +630,13 @@ def fetch_active_markets_by_category(
                    f"({len(incentive_market_list)} incentive, {len(regular_market_list)} regular)")
         logger.info(f"Skipped: {skipped_parlay} parlays, {skipped_liquidity} illiquid, {skipped_longshot} longshots")
 
-        # Log breakdown of parlay filter reasons for debugging
+        # Log breakdown of filter reasons for debugging
         if parlay_reasons:
             logger.info(f"Parlay filter breakdown: {parlay_reasons}")
+        if liquidity_reasons:
+            logger.info(f"Liquidity filter breakdown: {liquidity_reasons}")
+        if longshot_reasons:
+            logger.info(f"Longshot filter breakdown: {longshot_reasons}")
 
     except Exception as e:
         logger.error(f"Failed to fetch markets for category {category}: {e}")
