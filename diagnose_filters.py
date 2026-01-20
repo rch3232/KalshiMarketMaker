@@ -69,7 +69,12 @@ for m in markets:
     title = m.get('title', '')[:50]
     yes_bid = m.get('yes_bid', 0) or 0
     yes_ask = m.get('yes_ask', 0) or 0
+    no_bid = m.get('no_bid', 0) or 0
     volume = m.get('volume', 0) or m.get('volume_24h', 0) or 0
+
+    # Derive yes_ask from no_bid if missing (reciprocal relationship)
+    if yes_ask == 0 and no_bid > 0:
+        yes_ask = 100 - no_bid
 
     # Check filters
     if yes_bid == 0 or yes_ask == 0:

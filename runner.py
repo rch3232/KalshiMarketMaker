@@ -55,13 +55,19 @@ def check_market_liquidity(market: Dict, min_volume: int = 0, max_spread_cents: 
     Returns:
         tuple of (is_liquid: bool, reason: str if not liquid)
     """
-    # Get bid/ask data
+    # Get bid/ask data - Kalshi API may not return yes_ask directly
+    # Need to derive it from no_bid: yes_ask = 100 - no_bid
     yes_bid = market.get('yes_bid', 0) or 0
     yes_ask = market.get('yes_ask', 0) or 0
+    no_bid = market.get('no_bid', 0) or 0
+
+    # If yes_ask is missing, derive it from no_bid (reciprocal relationship)
+    if yes_ask == 0 and no_bid > 0:
+        yes_ask = 100 - no_bid
 
     # Check 1: Must have both bid and ask (not an empty order book)
     if yes_bid == 0 or yes_ask == 0:
-        return False, f"empty order book (yes_bid={yes_bid}, yes_ask={yes_ask})"
+        return False, f"empty order book (yes_bid={yes_bid}, yes_ask={yes_ask}, no_bid={no_bid})"
 
     # Check 2: Spread must not be too wide
     spread = yes_ask - yes_bid
@@ -92,8 +98,14 @@ def check_longshot_bias(market: Dict, price_floor_cents: int = 20, price_ceiling
         tuple of (is_safe: bool, reason: str if not safe)
     """
     # Get bid/ask data to calculate mid-price
+    # Derive yes_ask from no_bid if not directly available
     yes_bid = market.get('yes_bid', 0) or 0
     yes_ask = market.get('yes_ask', 0) or 0
+    no_bid = market.get('no_bid', 0) or 0
+
+    # Derive yes_ask from no_bid if missing
+    if yes_ask == 0 and no_bid > 0:
+        yes_ask = 100 - no_bid
 
     # If no bid/ask, try last_price
     if yes_bid == 0 and yes_ask == 0:
