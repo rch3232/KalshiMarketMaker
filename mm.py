@@ -938,8 +938,10 @@ class KalshiTradingAPI(AbstractTradingAPI):
         try:
             while True:
                 # Build endpoint with pagination support
-                # mve_filter=exclude tells Kalshi to exclude multivariate (parlay/combo) markets
-                endpoint = f"/markets?category={category}&status=open&limit=200&mve_filter=exclude"
+                # Note: We don't use mve_filter=exclude because it filters out spread markets
+                # (like "Indiana wins by over 7.5 points") which are valid single-outcome binary markets.
+                # Client-side is_parlay_or_combo_market() handles actual parlay filtering.
+                endpoint = f"/markets?category={category}&status=open&limit=200"
                 if cursor:
                     endpoint += f"&cursor={cursor}"
 

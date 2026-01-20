@@ -14,8 +14,8 @@ from mm import KalshiTradingAPI, AvellanedaMarketMaker, get_shared_position_trac
 def is_parlay_or_combo_market(market: Dict) -> tuple[bool, str]:
     """Check if a market is a parlay/combo that should be skipped.
 
-    Note: The API call uses mve_filter=exclude to filter out most multivariate markets
-    at the source. This function provides additional client-side validation.
+    This filters out actual parlay/combo markets while allowing spread markets
+    (like "Indiana wins by over 7.5 points") which are valid binary markets.
 
     Returns:
         tuple of (should_skip: bool, reason: str)
