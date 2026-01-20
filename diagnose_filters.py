@@ -3,6 +3,7 @@
 
 import os
 import sys
+import yaml
 
 try:
     from dotenv import load_dotenv
@@ -28,6 +29,11 @@ if private_key_env.startswith('/') and os.path.isfile(private_key_env):
         private_key = f.read()
 else:
     private_key = private_key_env.replace('\\n', '\n')
+
+# Load config to get actual filter values
+config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
+with open(config_path, 'r') as f:
+    config = yaml.safe_load(f)
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -59,10 +65,20 @@ longshot_low = []
 longshot_high = []
 passed = []
 
-min_volume = 3500
-max_spread_cents = 15
-price_floor = 20
-price_ceiling = 80
+# Read filter values from config (same as runner.py uses)
+liquidity_config = config.get('liquidity_filter', {})
+longshot_config = config.get('longshot_filter', {})
+
+min_volume = liquidity_config.get('min_volume', 500)
+max_spread_cents = liquidity_config.get('max_spread_cents', 25)
+price_floor = longshot_config.get('price_floor_cents', 20)
+price_ceiling = longshot_config.get('price_ceiling_cents', 80)
+
+print(f"\nFilter settings (from config.yaml):")
+print(f"  min_volume: {min_volume}")
+print(f"  max_spread_cents: {max_spread_cents}")
+print(f"  price_floor: {price_floor}¢")
+print(f"  price_ceiling: {price_ceiling}¢")
 
 for m in markets:
     ticker = m.get('ticker', 'UNKNOWN')

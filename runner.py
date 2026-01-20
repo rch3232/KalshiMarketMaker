@@ -586,15 +586,12 @@ def fetch_active_markets_by_category(
 
             # Check liquidity requirements
             # - Regular markets: full check (order book, spread, volume)
-            # - Incentive markets: only check volume (bypass spread/order book checks)
+            # - Incentive markets: BYPASS all liquidity checks (Kalshi is paying for liquidity)
             if has_incentive:
-                # Incentive markets only need to meet volume requirement
-                if min_volume > 0:
-                    volume = market.get('volume', 0) or market.get('volume_24h', 0) or 0
-                    if volume < min_volume:
-                        logger.debug(f"Skipping incentive market with low volume: {ticker} - volume {volume} < {min_volume}")
-                        skipped_liquidity += 1
-                        continue
+                # Incentive markets bypass ALL liquidity checks
+                # Kalshi is explicitly paying for liquidity in these markets, so trade them
+                # regardless of spread, order book depth, or volume
+                pass  # Skip directly to longshot filter
             else:
                 is_liquid, liq_reason = check_market_liquidity(market, min_volume, max_spread_cents)
                 if not is_liquid:
@@ -731,9 +728,9 @@ def run_dynamic_strategies(config: Dict):
     runner_logger.info(f"Max concurrent markets: {max_concurrent_markets}")
     runner_logger.info(f"Liquidity filter: min_volume={min_volume}, max_spread={max_spread_cents}¢")
     runner_logger.info(f"Long shot filter: enabled={longshot_enabled}, range={longshot_price_floor}¢-{longshot_price_ceiling}¢")
-    runner_logger.info(f"Liquidity incentives: enabled={incentives_enabled}, refresh=30min")
+    runner_logger.info(f"Liquidity incentives: enabled={incentives_enabled}, refresh=5min")
     if incentives_enabled:
-        runner_logger.info(f"  Incentive markets bypass spread/longshot filters and get priority")
+        runner_logger.info(f"  Incentive markets bypass ALL liquidity filters (spread, volume, order book)")
         runner_logger.info(f"  Incentive max_position: {incentive_config.get('max_position', 15)}")
         runner_logger.info(f"  Heavy position threshold: {incentive_config.get('heavy_position_threshold', 0.5)}")
         runner_logger.info(f"  Heavy position max bid: ${incentive_config.get('heavy_position_max_bid', 0.02):.2f}")
