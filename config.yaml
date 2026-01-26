@@ -1,47 +1,182 @@
-RATECUTCOUNT-24DEC31-T4:
-  api:
-    market_ticker: RATECUTCOUNT-24DEC31-T4
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 28800 # 8 hours
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 28800 # 8 hours
-    min_spread: 0.0
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
+# Kalshi Market Maker Configuration
+# Updated: January 2026
+# Mode: Dynamic - auto-fetches active markets
+# Engine: Desired State Engine with queue priority preservation
 
-FEDDECISION-24NOV-C25:
-  api:
-    market_ticker: FEDDECISION-24NOV-C25
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 28800 # 8 hours
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 28800 # 8 hours
-    min_spread: 0.0
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
+# =============================================================================
+# MARKET DISCOVERY
+# =============================================================================
+# The bot can discover markets in two ways:
+#
+# 1. CATEGORY (Recommended): Set 'category' to automatically find ALL markets
+#    in that category. For sports betting, use "Sports" to get every game,
+#    spread, and player prop currently open for trading.
+#
+# 2. SERIES (Legacy): Set 'series' list to fetch specific series only.
+#    This requires knowing the exact series tickers in advance.
 
-FEDDECISION-24NOV-H0:
-  api:
-    market_ticker: FEDDECISION-24NOV-H0
-    trade_side: "yes"
-  market_maker:
-    max_position: 5
-    order_expiration: 28800 # 8 hours
-    gamma: 0.1
-    k: 1.5
-    sigma: 0.001
-    T: 28800 # 8 hours
-    min_spread: 0.0
-    position_limit_buffer: 0.1
-    inventory_skew_factor: 0.001
-  dt: 2.0
+# Use category-based discovery to find ALL sports markets automatically
+# This finds NFL, NBA, MLB, NHL, soccer, and any other sports markets
+category: Sports
+
+# Legacy series-based approach (uncomment to use instead of category):
+# series:
+#   # NFL Individual Games
+#   - KXNFLGAME      # NFL Moneyline (who wins)
+#   - KXNFLSPREAD    # NFL Point Spread
+#   - KXNFLTOTAL     # NFL Total Points
+#   # NBA Individual Games
+#   - KXNBAGAME      # NBA Moneyline (who wins)
+#   - KXNBATOTAL     # NBA Total Points
+
+# =============================================================================
+# TIMING SETTINGS
+# =============================================================================
+
+# How often to check for new markets (in seconds)
+# Check every 2 minutes to pick up new games quickly
+refresh_interval: 120
+
+# How long each market maker runs before recycling (in seconds)
+# Set to 1 hour - markets will be re-evaluated and restarted if still active
+market_duration: 3600
+
+# Loop interval - how often to update quotes (in seconds)
+# NOTE: The Desired State Engine preserves queue priority, so frequent updates
+# won't hurt your position in line (orders only reprice if price changes AND
+# order age > MIN_ORDER_AGE)
+dt: 2.0
+
+# Maximum number of markets to trade simultaneously
+# Higher value allows managing positions while still discovering new markets
+max_concurrent_markets: 75
+
+# =============================================================================
+# LIQUIDITY FILTER
+# =============================================================================
+# Skip markets that don't meet minimum liquidity requirements
+
+liquidity_filter:
+  # Minimum 24h volume required (0 = disabled)
+  # Only applies to regular markets - incentive markets bypass this check
+  min_volume: 3000
+
+  # Maximum bid-ask spread in cents
+  # Markets with spreads wider than this are skipped (likely illiquid)
+  # 5 = only trade tight markets with spread <= 5¢
+  max_spread_cents: 5
+
+# =============================================================================
+# LONG SHOT BIAS FILTER
+# =============================================================================
+# Avoid trading markets with extreme prices (long shot bias)
+# Markets near 0 or 100 cents tend to be mispriced and risky
+
+longshot_filter:
+  # Enable/disable the long shot filter
+  enabled: true
+
+  # Minimum YES price in cents (skip if price < this)
+  # 20 = skip markets priced below 20¢ (highly unlikely outcomes)
+  price_floor_cents: 20
+
+  # Maximum YES price in cents (skip if price > this)
+  # 80 = skip markets priced above 80¢ (near-certain outcomes)
+  price_ceiling_cents: 80
+
+# =============================================================================
+# LIQUIDITY INCENTIVES
+# =============================================================================
+# Kalshi's Liquidity Incentive Program pays for resting orders within 2¢ of strike
+# Markets with incentives are prioritized and have relaxed filtering rules
+
+liquidity_incentives:
+  # Enable fetching and prioritizing incentive markets
+  enabled: true
+
+  # Incentive markets are checked every 5 minutes (synced with refresh_interval)
+  # They get priority in the market queue with special filter handling:
+  # - Volume check: BYPASSED (trade even with low/no volume)
+  # - Spread/order book check: BYPASSED (trade even with wide spreads)
+  # - Long shot filter: APPLIED (20-80 cent range enforced)
+
+  # Position limits for incentive markets (overrides market_maker.max_position)
+  max_position: 15             # Max contracts per side for incentive markets
+
+  # Heavy position handling - when position gets too large, cap bids at minimum
+  # to avoid adding more risk while still earning incentive rewards
+  heavy_position_threshold: 0.5  # 50% of max_position triggers heavy mode
+  heavy_position_max_bid: 0.02   # Cap bids at 2¢ when in heavy position mode
+
+# =============================================================================
+# MARKET MAKER PARAMETERS
+# =============================================================================
+
+market_maker:
+  # Position limits
+  max_position: 5              # Max contracts per side
+  position_limit_buffer: 0.1   # 10% buffer near limits
+
+  # ==========================================================================
+  # DESIRED STATE ENGINE - TICK-AWARE PRICING
+  # ==========================================================================
+  # The engine automatically detects the market's min_tick_size and adjusts:
+  #
+  # STANDARD MARKETS (min_tick_size = 0.01 = 1 cent):
+  #   - Spread: 2 cents (bid 1¢ below mid)
+  #   - Uses integer cent pricing (yes_price/no_price)
+  #
+  # SUB-PENNY MARKETS (min_tick_size = 0.005 = 0.5 cent):
+  #   - Spread: 1 cent (bid 0.5¢ below mid)
+  #   - Uses dollar string pricing (yes_price_dollars/no_price_dollars)
+  #   - Rounds to nearest half-cent
+  #
+  # NOTE: Some NBA/NFL games trade in half-pennies - the bot will automatically
+  # detect these and switch to sub-penny pricing mode.
+
+  # Spread settings (these are fallbacks; tick-aware logic takes precedence)
+  min_spread: 0.02             # $0.02 minimum spread (standard 1¢ tick markets)
+  max_spread: 0.02             # $0.02 maximum spread
+
+  # ==========================================================================
+  # QUEUE PRIORITY PRESERVATION
+  # ==========================================================================
+  # The Desired State Engine reconciles orders instead of cancel-and-replace:
+  #
+  # 1. If price matches: Keep order (preserve queue position)
+  #    - If quantity too high: Use POST /orders/{id}/decrease to trim
+  # 2. If price changed AND order age > MIN_ORDER_AGE (10s): Cancel and replace
+  # 3. If price changed AND order age < MIN_ORDER_AGE: Wait (stay in line)
+  #
+  # This prevents losing queue priority from frequent repricing.
+  # MIN_ORDER_AGE is hardcoded to 10 seconds in the engine.
+
+  # Avellaneda-Stoikov parameters (calibrated for 0.00-1.00 probability scale)
+  gamma: 0.02                  # Risk aversion (scaled down: 0.01-0.05 range)
+  k: 1.5                       # Liquidity parameter
+  sigma: 0.10                  # Volatility estimate for binary outcomes
+
+  # Dual-Quote flipping strategy
+  flip_skew_factor: 0.03       # Asymmetric urgency for inventory flipping
+                               # When long YES, pushes NO bid closer to mid by q*0.03
+
+  # Auto-exit settings (for one-sided fills)
+  # If one side fills but the opposite doesn't within timeout, exit at small profit
+  exit_timeout: 30             # Seconds to wait before auto-exit (default: 30)
+  exit_profit_target: 0.02     # Exit price = entry + this amount ($0.02 = 2 cents)
+
+  # ==========================================================================
+  # PROFITABILITY CONSTRAINT
+  # ==========================================================================
+  # Prevents guaranteed losses from buying both YES and NO at combined > $1.00
+  #
+  # Normal mode: If you bought YES at 70¢, it caps NO bid at 30¢ (break even)
+  # Near close mode: Allows small losses to exit positions before market closes
+  #
+  # Example: YES cost=70¢, max_loss=5¢ -> near close NO bid capped at 35¢
+
+  near_close_seconds: 300      # Seconds before close to allow small losses (5 min)
+  max_loss_near_close: 0.05    # Max loss allowed near close ($0.05 = 5 cents)
+
+  # Order settings
+  order_expiration: 300        # Orders expire after 5 minutes (faster refresh)
